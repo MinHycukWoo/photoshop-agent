@@ -16,8 +16,14 @@ const DEFAULTS: Config = { port: 8765, requestTimeoutMs: 120_000 };
 export function loadConfig(): Config {
   try {
     const raw = JSON.parse(readFileSync(join(SERVER_DIR, "config.json"), "utf8"));
-    return { ...DEFAULTS, ...raw };
+    return withEnv({ ...DEFAULTS, ...raw });
   } catch {
-    return DEFAULTS;
+    return withEnv(DEFAULTS);
   }
+}
+
+// 환경 변수 PS_AGENT_PORT 가 있으면 포트를 덮어쓴다 (자동 테스트가 실제 포트와 겹치지 않게)
+function withEnv(config: Config): Config {
+  const port = Number(process.env.PS_AGENT_PORT);
+  return port ? { ...config, port } : config;
 }
