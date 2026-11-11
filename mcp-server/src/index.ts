@@ -6,9 +6,11 @@ import { loadConfig } from "./config.js";
 import { PhotoshopBridge, NOT_CONNECTED_MESSAGE, log } from "./bridge.js";
 import { savePng } from "./output.js";
 import { logCall } from "./logger.js";
+import { GenerationBudget } from "./credits.js";
 
 const config = loadConfig();
 const bridge = new PhotoshopBridge(config.port, config.requestTimeoutMs);
+const budget = new GenerationBudget(config.maxGenerationsPerRun); // 생성 횟수 상한 (크레딧 보호)
 
 const server = new McpServer({ name: "photoshop-agent", version: "0.2.0" });
 
@@ -85,18 +87,24 @@ register(
   {
     title: "포토샵 연결 상태",
     description:
-      "Photoshop 플러그인 연결 여부, Photoshop 버전, 열린 문서 목록(이름·크기·레이어 수)과 현재 활성 문서를 확인한다. " +
+      "Photoshop 플러그인 연결 여부, Photoshop 버전, 열린 문서 목록(이름·크기·레이어 수), 현재 활성 문서, " +
+      "이번 실행에서 남은 생성 횟수(generations.remaining)를 확인한다. " +
       "포토샵 작업을 시작하기 전이나 다른 도구가 연결 오류를 냈을 때 먼저 호출한다. " +
       "생성형 크레딧을 쓰지 않고 문서를 바꾸지 않는 읽기 전용 도구다.",
     annotations: { readOnlyHint: true },
   },
   async () => {
     if (bridge.listenError) return fail(bridge.listenError);
+    const serverInfo = {
+      generations: budget.status,
+      pluginOrigin: bridge.pluginOrigin,
+      rejectedConnections: bridge.rejectedCount,
+    };
     if (!bridge.isConnected) {
       // 연결 안 된 것도 "상태"이므로 오류가 아니라 정상 결과로 알려 준다
-      return { content: [text({ connected: false, message: NOT_CONNECTED_MESSAGE })] };
+      return { content: [text({ connected: false, message: NOT_CONNECTED_MESSAGE, ...serverInfo })] };
     }
-    return guarded(async () => [text({ connected: true, ...((await bridge.send("status")) as object) })]);
+    return guarded(async () => [text({ connected: true, ...((await bridge.send("status")) as object), ...serverInfo })]);
   },
 );
 
@@ -127,15 +135,16 @@ register(
       "맨 위에 새 레이어(프롬프트 이름의 Generative Layer)로 추가한다. 약 10~30초 걸린다. " +
       "결과를 output/ 에 PNG 로 저장하고 미리보기 이미지를 함께 돌려주므로, 결과를 보고 요청과 다르면 프롬프트를 고쳐 다시 호출할 수 있다. " +
       "열린 문서가 없으면 먼저 ps_create_document 를 호출한다. 그림의 일부만 바꾸려면 이 도구 대신 ps_generative_fill 을 쓴다. " +
-      "같은 프롬프트를 의미 없이 반복 호출하지 않는다.",
+      "같은 프롬프트를 의미 없이 반복 호출하지 않는다. " +
+      `서버 실행 1회당 생성(이 도구 + ps_generative_fill 합계)은 ${config.maxGenerationsPerRun}회로 제한되며, 결과의 generationCount 로 사용량을 알 수 있다.`,
     inputSchema: { prompt },
   },
   async ({ prompt }) =>
     guarded(async () => {
-      log(`이미지 생성 요청: ${prompt}`);
+      const generationCount = budget.reserve(`이미지 생성 "${prompt}"`); // 상한을 넘으면 여기서 멈춘다
       const gen = await bridge.send("generateImage", { prompt });
       const shown = await exportAndShow(prompt);
-      return [text({ generated: gen, savedTo: shown.path }), ...shown.content];
+      return [text({ generated: gen, generationCount, savedTo: shown.path }), ...shown.content];
     }),
 );
 
@@ -147,7 +156,8 @@ register(
       "⚠️ Adobe 생성형 크레딧을 1회 사용한다. 현재 활성 문서에서 사각형 영역(픽셀 좌표, 왼쪽 위가 0,0)을 Generative Fill 로 채워 " +
       "마스크가 달린 새 레이어로 추가한다. 약 20~40초 걸린다. 그림의 일부에 무언가를 추가하거나 바꿀 때 쓴다. " +
       "결과를 output/ 에 PNG 로 저장하고 미리보기 이미지를 함께 돌려준다. " +
-      "그림 전체를 새로 만들 때는 ps_generate_image 를 쓴다. 좌표를 모르면 먼저 ps_status 나 ps_list_layers 로 캔버스 크기를 확인한다.",
+      "그림 전체를 새로 만들 때는 ps_generate_image 를 쓴다. 좌표를 모르면 먼저 ps_status 나 ps_list_layers 로 캔버스 크기를 확인한다. " +
+      `생성 횟수 상한(ps_generate_image 와 합계 ${config.maxGenerationsPerRun}회)에 포함된다.`,
     inputSchema: {
       prompt,
       left: z.number().int().min(0).describe("영역 왼쪽 x (픽셀)"),
@@ -158,10 +168,16 @@ register(
   },
   async (args) =>
     guarded(async () => {
-      log(`생성형 채우기 요청: ${args.prompt} @ ${args.left},${args.top},${args.right},${args.bottom}`);
+      // 좌표 순서가 틀린 요청은 크레딧(횟수)을 쓰기 전에 거절한다
+      if (args.left >= args.right || args.top >= args.bottom) {
+        throw new Error(`영역이 잘못됐습니다: left(${args.left}) < right(${args.right}), top(${args.top}) < bottom(${args.bottom}) 이어야 합니다.`);
+      }
+      const generationCount = budget.reserve(
+        `생성형 채우기 "${args.prompt}" @ ${args.left},${args.top},${args.right},${args.bottom}`,
+      );
       const gen = await bridge.send("generativeFill", args);
       const shown = await exportAndShow(args.prompt);
-      return [text({ generated: gen, savedTo: shown.path }), ...shown.content];
+      return [text({ generated: gen, generationCount, savedTo: shown.path }), ...shown.content];
     }),
 );
 

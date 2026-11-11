@@ -4,7 +4,9 @@ const { storage } = require("uxp");
 const firefly = require("./firefly.js");
 
 const SERVER_URL = "ws://127.0.0.1:8765"; // mcp-server/config.json 의 port 와 같아야 한다
-const BUILD = 6; // 새로 로드됐는지 확인용 (코드를 바꿀 때마다 올린다)
+// manifest network.domains 는 "all" 이어야 한다: 주소 지정 형식은 PS 28 에서 Permission denied (4단계에서 재검증)
+// 대신 접속 주소는 아래 SERVER_URL 하나로 고정돼 있고, 서버는 127.0.0.1 전용 + Origin 허용 목록으로 지킨다
+const BUILD = 8; // 새로 로드됐는지 확인용 (코드·manifest 를 바꿀 때마다 올린다)
 
 let socket = null;
 

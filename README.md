@@ -29,8 +29,8 @@ Claude에게 **"창가에 앉은 고양이를 수채화 느낌으로 만들어 �
 | 1 | ★ 가능성 검증: 생성형 AI를 batchPlay로 호출 | ✅ 완료 | [01-가능성검증](docs/progress/01-가능성검증.md) |
 | 2 | 연결 통로 (MCP 서버 ↔ 플러그인, `ps_status`) | ✅ 완료 | [02-연결통로](docs/progress/02-연결통로.md) |
 | 3 | 핵심 도구 (문서 생성 · 이미지 생성 · 생성형 채우기 · 레이어 · PNG 내보내기) + 호출 기록 | ✅ 완료 | [03-핵심도구](docs/progress/03-핵심도구.md) |
-| 4 | 안전장치 (생성 횟수 상한 · 저장 경로 제한 · 접속 제한) | ⏳ 다음 | |
-| 5 | Claude Desktop 연결 · 시나리오 테스트 | | |
+| 4 | 안전장치 (생성 횟수 상한 · Origin 허용 목록 · 저장 경로 제한 · 기록) | ✅ 완료 | [04-안전장치](docs/progress/04-안전장치.md) |
+| 5 | Claude Desktop 연결 · 시나리오 테스트 | ⏳ 다음 | |
 | 6 | 문서화 (`docs/README.ko.md`) | | |
 
 ### 단계별 요약
@@ -45,6 +45,9 @@ Claude에게 **"창가에 앉은 고양이를 수채화 느낌으로 만들어 �
 - **3단계 — 핵심 도구:** 도구 6개 완성. 생성 · 내보내기 결과를 `output/` 에 저장하고 **미리보기 이미지를 Claude 에게 반환** (에이전트 루프의 "관찰").
   PNG 는 플러그인 임시 폴더에 저장 → 서버가 `output/` 에 기록 (플러그인에 파일 권한 불필요).
   모든 도구 호출을 `logs/날짜.md` (이미지 포함) · `.jsonl` 로 기록. 채우기 ~42초.
+- **4단계 — 안전장치:** 임의 코드 실행 도구 없음 · `127.0.0.1` 전용 · **Origin 허용 목록**(UXP 는 `file://`, 브라우저 접속 거절) ·
+  `output/` 밖 저장 차단 · **생성 횟수 상한**(서버 실행당 10회, `config.json`, 실패도 1회로 셈, 남은 횟수를 Claude 에게 알림).
+  manifest 주소 지정 형식은 재검증에서도 거부 → `"all"` 유지 (접속 주소 고정 · 서버 측 제한으로 보완).
 
 ## MCP 도구
 
@@ -56,6 +59,14 @@ Claude에게 **"창가에 앉은 고양이를 수채화 느낌으로 만들어 �
 | `ps_generative_fill` | 사각형 영역을 프롬프트로 채우기 → 저장 + 미리보기 반환 (⚠️ 생성형 크레딧 사용) | ✅ |
 | `ps_list_layers` | 레이어 목록 (id · 이름 · 종류 · 영역) | ✅ |
 | `ps_export_png` | `output/` 에 PNG 저장 + Claude가 볼 수 있게 이미지 반환 | ✅ |
+
+## 설정 (`mcp-server/config.json`)
+
+| 키 | 기본값 | 뜻 |
+|---|---|---|
+| `port` | 8765 | 플러그인이 접속할 WebSocket 포트 (`ps-plugin/main.js` 의 `SERVER_URL` 과 같아야 함) |
+| `requestTimeoutMs` | 120000 | 포토샵 응답 대기 최대 시간 |
+| `maxGenerationsPerRun` | 10 | 서버 실행 1회당 생성형 AI 호출 상한 (크레딧 보호) |
 
 ## 실행 방법 (현재)
 
@@ -71,12 +82,12 @@ npm run inspector   # MCP Inspector 로 도구 테스트
 3. Inspector → Tools → 도구 선택 → *Execute Tool*
 4. 호출 기록: `logs/YYYY-MM-DD.md` (VS Code 에서 `Ctrl+Shift+V` 로 결과 이미지까지 보기)
 
-포토샵 없이 서버만 점검: `node scripts/selftest.mjs` (가짜 플러그인 · 전용 포트 18765 · 크레딧 사용 없음)
+포토샵 없이 서버만 점검: `node scripts/selftest.mjs` (가짜 플러그인 · 전용 포트 18765 · 크레딧 사용 없음 · 17개 항목)
 
 ## 폴더
 
 ```
-mcp-server/    TypeScript MCP 서버 (index.ts 도구, bridge.ts 통로, output.ts 저장, logger.ts 기록)
+mcp-server/    TypeScript MCP 서버 (index.ts 도구, bridge.ts 통로, output.ts 저장, logger.ts 기록, credits.ts 생성 상한)
 ps-plugin/     포토샵 UXP 플러그인 (main.js 명령 처리, firefly.js 생성형 AI batchPlay)
 experiments/   단계별 검증 스크립트 · 액션 녹화 원본
 docs/progress/ 단계별 작업 기록

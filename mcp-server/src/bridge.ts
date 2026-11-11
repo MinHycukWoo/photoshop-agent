@@ -22,10 +22,28 @@ export class PhotoshopBridge {
   private pending = new Map<number, Pending>(); // 응답을 기다리는 요청들 (id → 대기 정보)
   private nextId = 1;
   public listenError: string | null = null; // 포트를 못 열었을 때 이유
+  public pluginOrigin: string | null = null; // 지금 연결된 플러그인이 보낸 Origin 헤더 (확인용)
+  public rejectedCount = 0; // 거절한 접속 수
 
   constructor(port: number, private timeoutMs: number) {
     // 127.0.0.1 에서만 열어 다른 컴퓨터에서는 접속할 수 없게 한다
-    this.wss = new WebSocketServer({ host: "127.0.0.1", port });
+    this.wss = new WebSocketServer({
+      host: "127.0.0.1",
+      port,
+      maxPayload: 64 * 1024 * 1024, // PNG 전송용으로 넉넉히, 그 이상은 거절
+      // 허용 목록: UXP 플러그인은 Origin "file://" 을 보낸다 (4단계에서 확인).
+      // Origin 이 없는 접속(Node 로 만든 테스트 도구)도 허용한다.
+      // 웹 브라우저의 페이지는 항상 http(s):// 나 null 같은 Origin 을 붙이므로 여기서 걸러진다
+      // → 악성 웹페이지가 플러그인 행세를 하며 명령을 가로채지 못한다.
+      verifyClient: ({ origin }: { origin?: string }) => {
+        const allowed = origin === undefined || origin === "file://";
+        if (!allowed) {
+          this.rejectedCount++;
+          log(`접속 거절 (허용되지 않은 Origin: ${origin})`);
+        }
+        return allowed;
+      },
+    });
 
     this.wss.on("listening", () => log(`WebSocket 대기 중: ws://127.0.0.1:${port}`));
     this.wss.on("error", (err) => {
@@ -35,8 +53,8 @@ export class PhotoshopBridge {
     });
 
     this.wss.on("connection", (socket, req) => {
-      // Origin 은 4단계(보안)에서 접속 제한에 쓸 수 있는지 보려고 기록만 해 둔다
-      log(`플러그인 접속 (origin: ${req.headers.origin ?? "없음"})`);
+      this.pluginOrigin = req.headers.origin ?? "(없음)";
+      log(`플러그인 접속 (origin: ${this.pluginOrigin})`);
       // 새 플러그인이 붙으면 이전 연결은 닫는다 (항상 하나만 유지)
       if (this.plugin && this.plugin !== socket) this.plugin.close();
       this.plugin = socket;
