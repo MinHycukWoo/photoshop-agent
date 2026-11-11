@@ -96,6 +96,7 @@ register(
   async () => {
     if (bridge.listenError) return fail(bridge.listenError);
     const serverInfo = {
+      serverRole: bridge.role, // hub = 플러그인과 직접 연결, relay = 다른 서버를 거쳐 연결
       generations: budget.status,
       pluginOrigin: bridge.pluginOrigin,
       rejectedConnections: bridge.rejectedCount,
@@ -114,8 +115,9 @@ register(
     title: "새 캔버스 만들기",
     description:
       "지정한 크기(픽셀)의 흰색 RGB 새 문서를 만들고 활성 문서로 만든다. " +
-      "새 그림을 처음부터 만들 때 ps_generate_image 전에 호출한다. " +
-      "이미 작업 중인 그림을 고치거나 다시 생성할 때는 새 문서를 만들지 말고 기존 활성 문서를 쓴다. 크레딧을 쓰지 않는다.",
+      "새 그림을 처음부터 만들 때, 또는 사용자가 크기를 지정했는데 활성 문서 크기가 다를 때 ps_generate_image 전에 호출한다 " +
+      "(다른 문서가 열려 있어도 새로 만든다). 크기 지정이 없으면 1024x1024 를 쓴다. " +
+      "방금 만든 그림을 고치거나 다시 생성할 때는 새 문서를 만들지 말고 기존 활성 문서를 쓴다. 크레딧을 쓰지 않는다.",
     inputSchema: {
       width: z.number().int().min(64).max(4096).describe("가로 픽셀 (64~4096)"),
       height: z.number().int().min(64).max(4096).describe("세로 픽셀 (64~4096)"),
@@ -134,7 +136,10 @@ register(
       "⚠️ Adobe 생성형 크레딧을 1회 사용한다. Photoshop 의 Generate Image(Firefly)로 현재 활성 문서 전체 크기의 이미지를 만들어 " +
       "맨 위에 새 레이어(프롬프트 이름의 Generative Layer)로 추가한다. 약 10~30초 걸린다. " +
       "결과를 output/ 에 PNG 로 저장하고 미리보기 이미지를 함께 돌려주므로, 결과를 보고 요청과 다르면 프롬프트를 고쳐 다시 호출할 수 있다. " +
-      "열린 문서가 없으면 먼저 ps_create_document 를 호출한다. 그림의 일부만 바꾸려면 이 도구 대신 ps_generative_fill 을 쓴다. " +
+      "이미지 크기는 활성 문서 크기를 따른다. 따라서 사용자가 새 그림을 요청했거나 크기(예: 1920x1080)를 지정했으면, " +
+      "다른 문서가 열려 있더라도 먼저 ps_create_document 로 그 크기의 새 캔버스를 만든 뒤 호출한다. " +
+      "방금 만든 그림을 다시 만들거나 고치라는 요청일 때만 기존 활성 문서를 그대로 쓴다. 그림의 일부만 바꾸려면 이 도구 대신 ps_generative_fill 을 쓴다. " +
+      "Firefly 가 콘텐츠 정책(폭력·공포·실존 인물·상표·캐릭터 이름 등)으로 거절하면 '생성이 실패했습니다' 오류가 오므로, 표현을 순화해 다시 시도한다. " +
       "같은 프롬프트를 의미 없이 반복 호출하지 않는다. " +
       `서버 실행 1회당 생성(이 도구 + ps_generative_fill 합계)은 ${config.maxGenerationsPerRun}회로 제한되며, 결과의 generationCount 로 사용량을 알 수 있다.`,
     inputSchema: { prompt },

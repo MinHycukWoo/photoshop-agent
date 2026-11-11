@@ -2,6 +2,7 @@
 //  ① 도구 목록   ② 미연결 안내   ③ 가짜 플러그인 왕복(status)
 //  ④ ps_export_png: PNG 저장 + 미리보기 이미지 반환   ⑤ 위험한 파일 이름이 output/ 밖으로 못 나가는지
 //  ⑥ logs 기록   ⑦ 생성 횟수 상한   ⑧ 잘못된 영역 거절   ⑨ 브라우저 Origin 접속 거절
+//  ⑩ 서버 2개 동시 실행(relay)   ⑪ 중계소가 꺼지면 relay 가 넘겨받기
 // 실행: npm run build 후  node scripts/selftest.mjs
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -115,11 +116,39 @@ for (const origin of ["https://evil.example", "null"]) {
 const st2 = JSON.parse((await call("ps_status")).content[0].text);
 check("⑨ 기존 플러그인 연결은 유지", st2.connected === true && st2.rejectedConnections === 2);
 
+// ⑩ 서버가 2개 떠도 동작 (Claude Desktop 이 서버를 2번 실행한 상황 재현)
+//    두 번째 서버는 포트를 못 잡으므로 relay 가 되어, 첫 번째 서버(hub)를 거쳐 플러그인에 전달해야 한다
+const client2 = new Client({ name: "selftest-2", version: "0.0.1" });
+await client2.connect(
+  new StdioClientTransport({
+    command: "node",
+    args: ["dist/index.js"],
+    env: { ...process.env, PS_AGENT_PORT: String(PORT), PS_AGENT_LOGS_DIR: LOGS, PS_AGENT_MAX_GENERATIONS: "2" },
+    stderr: "inherit",
+  }),
+);
+await new Promise((r) => setTimeout(r, 500)); // relay 가 중계소에 붙을 시간
+const status2 = JSON.parse((await client2.callTool({ name: "ps_status", arguments: {} })).content[0].text);
+check("⑩ 두 번째 서버는 relay 로 연결됨", status2.serverRole === "relay" && status2.connected === true, `role=${status2.serverRole}`);
+const exp2 = await client2.callTool({ name: "ps_export_png", arguments: { filename: "relay" } });
+const relayPath = exp2.content.find((c) => c.type === "text")?.text.match(/저장: (.+?\.png)/)?.[1];
+savedPaths.push(relayPath);
+check("⑩ relay 를 거쳐 PNG 내보내기", !exp2.isError && !!relayPath && existsSync(relayPath));
+
+// ⑪ 중계소(첫 번째 서버)가 꺼지면 relay 가 포트를 넘겨받는다
+await client.close(); // 첫 번째 서버 종료 → 가짜 플러그인 연결도 끊김
+let role2 = "";
+for (let i = 0; i < 20 && role2 !== "hub"; i++) {
+  await new Promise((r) => setTimeout(r, 200));
+  role2 = JSON.parse((await client2.callTool({ name: "ps_status", arguments: {} })).content[0].text).serverRole;
+}
+check("⑪ 중계소가 꺼지면 relay 가 새 중계소가 됨", role2 === "hub", `role=${role2}`);
+await client2.close();
+
 // 테스트로 만든 파일 정리
 for (const p of savedPaths) if (p && existsSync(p)) rmSync(p);
 rmSync(LOGS, { recursive: true, force: true });
 
 fake.close();
-await client.close();
 console.log(failed ? `\n${failed}개 실패` : "\n모두 통과");
 process.exit(failed ? 1 : 0);

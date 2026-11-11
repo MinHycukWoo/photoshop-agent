@@ -6,7 +6,7 @@ const firefly = require("./firefly.js");
 const SERVER_URL = "ws://127.0.0.1:8765"; // mcp-server/config.json 의 port 와 같아야 한다
 // manifest network.domains 는 "all" 이어야 한다: 주소 지정 형식은 PS 28 에서 Permission denied (4단계에서 재검증)
 // 대신 접속 주소는 아래 SERVER_URL 하나로 고정돼 있고, 서버는 127.0.0.1 전용 + Origin 허용 목록으로 지킨다
-const BUILD = 8; // 새로 로드됐는지 확인용 (코드·manifest 를 바꿀 때마다 올린다)
+const BUILD = 12; // 새로 로드됐는지 확인용 (코드·manifest 를 바꿀 때마다 올린다)
 
 let socket = null;
 
@@ -18,6 +18,7 @@ function setState(kind, text) {
   $("state").textContent = text;
   $("connectBtn").textContent = kind === "off" ? "연결" : "연결 끊기";
 }
+
 
 function log(text) {
   const time = new Date().toLocaleTimeString();
@@ -60,8 +61,20 @@ async function runAndFindNewLayers(doc, commandName, work) {
   const before = new Set(doc.layers.map((l) => l.id));
   const started = Date.now();
   await core.executeAsModal(work, { commandName });
+  const seconds = Math.round((Date.now() - started) / 100) / 10;
   const newLayers = doc.layers.filter((l) => !before.has(l.id)).map(describeLayer);
-  return { seconds: Math.round((Date.now() - started) / 100) / 10, newLayers };
+  // 5단계에서 발견: Firefly 가 요청을 거절하면 batchPlay 는 오류 없이 2초쯤 만에 끝나고 레이어만 안 생긴다.
+  // "오류가 없으면 성공"이 아니라 "새 레이어가 생겨야 성공"으로 판단한다.
+  if (newLayers.length === 0) {
+    // 원인은 포토샵이 알려 주지 않으므로 가능한 원인을 모두 알리고, 먼저 화면 확인을 부탁하게 한다
+    throw new Error(
+      `생성이 실패했습니다: 포토샵이 ${seconds}초 만에 끝냈지만 새 레이어가 생기지 않았습니다. 포토샵은 이유를 알려 주지 않습니다. ` +
+        "가능한 원인: ① 크레딧·체험 횟수 부족으로 포토샵에 크레딧 구매 창이 뜸 ② Firefly 콘텐츠 정책 거절(폭력·공포·실존 인물·상표 등) ③ 로그인 만료. " +
+        "먼저 사용자에게 포토샵 화면에 창이나 알림이 떠 있는지 확인해 달라고 하세요. 창이 떠 있으면 닫아야 다음 명령이 실행됩니다. " +
+        "창이 없었다면 표현을 순화해 다시 시도할 수 있습니다.",
+    );
+  }
+  return { seconds, newLayers };
 }
 
 // ArrayBuffer → base64 (UXP 에는 Node 의 Buffer 가 없어서 직접 변환)
@@ -95,6 +108,7 @@ const handlers = {
       // app.version 은 PS 28 에서 null 이라, UXP 의 호스트 정보에서 읽는다 (2단계에서 확인)
       photoshopVersion: require("uxp").host.version,
       pluginBuild: BUILD,
+      generativeModels: firefly.MODEL, // 지금 쓰는 생성 모델 (표준 크레딧용)
       documentCount: docs.length,
       activeDocumentId: active ? active.id : null,
       documents: docs,
@@ -102,15 +116,34 @@ const handlers = {
   },
 
   // 새 캔버스 (공식 DOM API: app.documents.add, 모드·채움은 기본값 RGB·흰색)
+  // 5단계에서 발견: DOM 이 "Failed to create new document with given parameters." 만 돌려줘서 원인을 알 수 없었다.
+  // → 실패하면 1단계에서 녹화로 확인한 batchPlay "make" 로 한 번 더 시도하고, 그것도 실패하면 포토샵의 자세한 오류를 돌려준다.
   async createDocument({ width, height, name }) {
     let doc;
+    let domError = null;
+    let via = "documents.add";
     await core.executeAsModal(
       async () => {
-        doc = await app.documents.add({ width, height, resolution: 72, name });
+        try {
+          doc = await app.documents.add({ width, height, resolution: 72, name });
+        } catch (e) {
+          domError = e && e.message ? e.message : String(e);
+          log(`documents.add 실패 → batchPlay make 로 재시도: ${domError}`);
+          via = "batchPlay make (이름 지정 없음)";
+          await play([firefly.makeDocument({ width, height })]); // 실패하면 포토샵의 오류 메시지로 예외
+          doc = app.activeDocument;
+        }
       },
       { commandName: "PS Agent: 새 문서" },
-    );
-    return { id: doc.id, name: doc.name, width: doc.width, height: doc.height };
+    ).catch((e) => {
+      const detail = e && e.message ? e.message : String(e);
+      throw new Error(
+        `새 문서를 만들 수 없습니다. 포토샵 오류: ${detail}` +
+          (domError ? ` (먼저 documents.add 도 실패: ${domError})` : "") +
+          ". 포토샵에 대화상자나 경고 창이 열려 있으면 다른 명령이 막히므로, 사용자에게 포토샵 화면을 확인해 달라고 요청하세요.",
+      );
+    });
+    return { id: doc.id, name: doc.name, width: doc.width, height: doc.height, via };
   },
 
   async listLayers() {
@@ -185,38 +218,77 @@ async function handleMessage(raw) {
     log(`✔ ${command}`);
   } catch (e) {
     // 실패도 같은 id 로 돌려줘야 서버가 기다리지 않는다
-    const message = e && e.message ? e.message : String(e);
+    let message = e && e.message ? e.message : String(e);
+    // 포토샵에 창(대화상자·크레딧 구매 창 등)이 열려 있으면 모든 명령이 이 오류로 막힌다 (5단계에서 확인)
+    if (/modal state/i.test(message)) {
+      message =
+        "포토샵에 창(대화상자·경고·크레딧 구매 창 등)이 열려 있어 명령을 실행할 수 없습니다. " +
+        `사용자에게 포토샵 화면의 창을 닫아 달라고 요청한 뒤 다시 시도하세요. (원문: ${message})`;
+    }
     if (socket) socket.send(JSON.stringify({ id, ok: false, error: message }));
     log(`✘ ${command}: ${message}`);
   }
 }
 
 // ── 연결 / 끊기 ───────────────────────────────────────
+// 사용자가 "연결"을 누른 뒤에는 연결이 끊겨도 자동으로 다시 붙는다.
+// (Claude Desktop 이 MCP 서버를 다시 띄우거나, 서버가 여러 개라 중계소가 바뀔 때)
+const RETRY_MS = 2000;
+let wantConnected = false; // 사용자가 연결을 원하는 상태인지
+let retryTimer = null;
+let retrying = false; // 재연결 중에는 로그를 한 번만 남긴다
+
 function connect() {
-  setState("wait", "연결 중...");
+  clearTimeout(retryTimer);
+  setState("wait", retrying ? "재연결 대기 중..." : "연결 중...");
   try {
     socket = new WebSocket(SERVER_URL);
   } catch (e) {
-    setState("off", "연결 안 됨");
+    socket = null;
     log(`연결 실패: ${e.message}`);
+    scheduleRetry();
     return;
   }
   socket.onopen = () => {
+    retrying = false;
     setState("on", "MCP 서버에 연결됨");
     log(`연결됨 ${SERVER_URL}`);
   };
   socket.onmessage = (event) => handleMessage(event.data);
-  socket.onerror = () => log("연결 오류 (MCP 서버가 실행 중인지 확인)");
+  socket.onerror = () => {
+    if (!retrying) log("연결 오류 (MCP 서버가 실행 중인지 확인)");
+  };
   socket.onclose = () => {
-    setState("off", "연결 안 됨");
-    log("연결 종료");
     socket = null;
+    if (wantConnected) {
+      if (!retrying) log(`연결 끊김 → ${RETRY_MS / 1000}초마다 다시 연결 시도`);
+      scheduleRetry();
+    } else {
+      setState("off", "연결 안 됨");
+      log("연결 종료");
+    }
   };
 }
 
+function scheduleRetry() {
+  if (!wantConnected) return setState("off", "연결 안 됨");
+  retrying = true;
+  setState("wait", "재연결 대기 중...");
+  retryTimer = setTimeout(connect, RETRY_MS);
+}
+
 $("connectBtn").addEventListener("click", () => {
-  if (socket) socket.close();
-  else connect();
+  if (wantConnected) {
+    // 연결 끊기: 자동 재연결도 멈춘다
+    wantConnected = false;
+    retrying = false;
+    clearTimeout(retryTimer);
+    if (socket) socket.close();
+    else setState("off", "연결 안 됨");
+  } else {
+    wantConnected = true;
+    connect();
+  }
 });
 
 setState("off", "연결 안 됨");

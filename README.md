@@ -30,8 +30,8 @@ Claude에게 **"창가에 앉은 고양이를 수채화 느낌으로 만들어 �
 | 2 | 연결 통로 (MCP 서버 ↔ 플러그인, `ps_status`) | ✅ 완료 | [02-연결통로](docs/progress/02-연결통로.md) |
 | 3 | 핵심 도구 (문서 생성 · 이미지 생성 · 생성형 채우기 · 레이어 · PNG 내보내기) + 호출 기록 | ✅ 완료 | [03-핵심도구](docs/progress/03-핵심도구.md) |
 | 4 | 안전장치 (생성 횟수 상한 · Origin 허용 목록 · 저장 경로 제한 · 기록) | ✅ 완료 | [04-안전장치](docs/progress/04-안전장치.md) |
-| 5 | Claude Desktop 연결 · 시나리오 테스트 | ⏳ 다음 | |
-| 6 | 문서화 (`docs/README.ko.md`) | | |
+| 5 | Claude Desktop 연결 · 시나리오 테스트 | ✅ 완료 | [05-클로드데스크톱연결](docs/progress/05-클로드데스크톱연결.md) |
+| 6 | 문서화 (`docs/README.ko.md`) | ⏳ 다음 | |
 
 ### 단계별 요약
 
@@ -48,6 +48,10 @@ Claude에게 **"창가에 앉은 고양이를 수채화 느낌으로 만들어 �
 - **4단계 — 안전장치:** 임의 코드 실행 도구 없음 · `127.0.0.1` 전용 · **Origin 허용 목록**(UXP 는 `file://`, 브라우저 접속 거절) ·
   `output/` 밖 저장 차단 · **생성 횟수 상한**(서버 실행당 10회, `config.json`, 실패도 1회로 셈, 남은 횟수를 Claude 에게 알림).
   manifest 주소 지정 형식은 재검증에서도 거부 → `"all"` 유지 (접속 주소 고정 · 서버 측 제한으로 보완).
+- **5단계 — Claude Desktop 연결:** Claude 가 스스로 캔버스 생성 → 이미지 생성 → 실패 판단 → 프롬프트 수정 · 재시도. 해결한 문제:
+  Claude Desktop 이 서버를 **2개 실행** → 중계소(hub)/relay 구조 + 플러그인 자동 재연결 ·
+  생성 실패를 성공으로 보고 → **새 레이어가 있어야 성공** · 1단계 녹화 모델이 **👑 프리미엄(Image 5)** 이라 체험 횟수 소진 →
+  표준 모델(`clio3` / `me_md`)로 **재녹화** · 크레딧 구매 창 등 모달 상태 안내. 설정 파일은 Store 버전에서 `Claude-Data` 폴더.
 
 ## MCP 도구
 
@@ -59,6 +63,21 @@ Claude에게 **"창가에 앉은 고양이를 수채화 느낌으로 만들어 �
 | `ps_generative_fill` | 사각형 영역을 프롬프트로 채우기 → 저장 + 미리보기 반환 (⚠️ 생성형 크레딧 사용) | ✅ |
 | `ps_list_layers` | 레이어 목록 (id · 이름 · 종류 · 영역) | ✅ |
 | `ps_export_png` | `output/` 에 PNG 저장 + Claude가 볼 수 있게 이미지 반환 | ✅ |
+
+## Claude Desktop 연결
+
+Claude Desktop → 설정 → 개발자 → **[구성 편집]** 이 여는 `claude_desktop_config.json` 에 추가 (경로는 설치 형태마다 다르니 추측하지 말 것):
+
+```json
+"mcpServers": {
+  "photoshop-agent": {
+    "command": "C:/Program Files/nodejs/node.exe",
+    "args": ["D:/photoshop-agent/mcp-server/dist/index.js"]
+  }
+}
+```
+
+저장 후 트레이 아이콘 → **종료** → 재실행 → 포토샵 PS Agent 패널에서 **연결**.
 
 ## 설정 (`mcp-server/config.json`)
 
@@ -82,13 +101,13 @@ npm run inspector   # MCP Inspector 로 도구 테스트
 3. Inspector → Tools → 도구 선택 → *Execute Tool*
 4. 호출 기록: `logs/YYYY-MM-DD.md` (VS Code 에서 `Ctrl+Shift+V` 로 결과 이미지까지 보기)
 
-포토샵 없이 서버만 점검: `node scripts/selftest.mjs` (가짜 플러그인 · 전용 포트 18765 · 크레딧 사용 없음 · 17개 항목)
+포토샵 없이 서버만 점검: `node scripts/selftest.mjs` (가짜 플러그인 · 전용 포트 18765 · 크레딧 사용 없음 · 서버 2개 동시 실행 포함 20개 항목)
 
 ## 폴더
 
 ```
 mcp-server/    TypeScript MCP 서버 (index.ts 도구, bridge.ts 통로, output.ts 저장, logger.ts 기록, credits.ts 생성 상한)
-ps-plugin/     포토샵 UXP 플러그인 (main.js 명령 처리, firefly.js 생성형 AI batchPlay)
+ps-plugin/     포토샵 UXP 플러그인 (main.js 명령 처리, firefly.js 생성형 AI batchPlay · 표준 모델)
 experiments/   단계별 검증 스크립트 · 액션 녹화 원본
 docs/progress/ 단계별 작업 기록
 output/        생성 이미지 (git 제외)
