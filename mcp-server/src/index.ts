@@ -7,12 +7,52 @@ import { PhotoshopBridge, NOT_CONNECTED_MESSAGE, log } from "./bridge.js";
 import { savePng } from "./output.js";
 import { logCall } from "./logger.js";
 import { GenerationBudget } from "./credits.js";
+import { readGuide, loadCases, findRepairPairs, searchCases, riskyWords, formatCase, formatPair } from "./knowledge.js";
 
 const config = loadConfig();
 const bridge = new PhotoshopBridge(config.port, config.requestTimeoutMs);
 const budget = new GenerationBudget(config.maxGenerationsPerRun); // 생성 횟수 상한 (크레딧 보호)
 
-const server = new McpServer({ name: "photoshop-agent", version: "0.2.0" });
+// instructions: MCP 클라이언트(Claude)에게 주는 "작업 순서 안내문".
+// 프롬프트 작가 · 사전 점검 · 실패 분석 역할을 Claude 가 이 순서대로 수행하게 한다.
+const INSTRUCTIONS = `Photoshop 생성형 AI 작업 순서:
+1) [프롬프트 작가] 새 이미지를 만들거나 다시 만들 때는 먼저 ps_prompt_guide 를 호출해 가이드와 과거 성공·실패 사례를 읽고,
+   사용자 요청(한국어여도)을 Firefly 용 영어 프롬프트로 작성한다. 사용자에게 최종 프롬프트와 한국어 뜻을 보여 준다.
+2) [사전 점검] 캐릭터·브랜드·실존 인물·유명 건축물 이름, 선정성·잔혹함 등 거절될 요소가 있으면 policy 규칙대로
+   내용 자체를 허용되는 방향으로 정직하게 바꾸고(예: 특정 캐릭터 → 오리지널 캐릭터), 생성 전에 무엇을 왜 바꿨는지 알리고 확인받는다.
+   거절될 내용을 철자·암시·우회 표현으로 숨겨 통과시키는 일은 하지 않는다. 사용자의 목적 자체가 그런 결과라면 만들지 않는다고 말하고 대안을 제안한다.
+3) 새 그림이거나 크기를 지정받았으면 ps_create_document 로 캔버스를 만든 뒤 ps_generate_image 를 호출한다.
+4) [실패 분석] 생성이 실패하면 오류에 붙은 "실패 분석" 을 따른다. 먼저 포토샵 화면에 창이 떠 있는지 사용자에게 확인하고,
+   콘텐츠 정책 거절로 보일 때만 2) 규칙으로 고쳐 한 번 재시도한다.
+5) 결과 미리보기 이미지를 보고 요청과 비교해, 다른 점이 있으면 솔직하게 알린다.`;
+
+const server = new McpServer({ name: "photoshop-agent", version: "0.3.0" }, { instructions: INSTRUCTIONS });
+
+// 생성 도구가 실패하면, 원인 추정 + 실패 원인 가이드 + 비슷한 "실패→성공" 사례를 오류에 붙여 돌려준다 (실패 분석 역할)
+async function withFailureHelp<T>(prompt: string, work: () => Promise<T>): Promise<T> {
+  try {
+    return await work();
+  } catch (err) {
+    const message = (err as Error).message;
+    const guess = /창이 열려|modal state/i.test(message)
+      ? "포토샵에 창(크레딧 구매 창·경고 등)이 열려 있음 → 사용자에게 창을 닫아 달라고 요청"
+      : /생성이 실패했습니다/.test(message)
+        ? "거절 또는 크레딧·체험 한도 → 먼저 포토샵 화면 확인, 창이 없었다면 콘텐츠 정책 거절로 보고 정직하게 고쳐 1회 재시도"
+        : /응답하지 않았습니다/.test(message)
+          ? "시간 초과 → 포토샵 화면 확인"
+          : "아래 표에서 신호가 맞는 원인을 찾을 것";
+    const pairs = findRepairPairs(await loadCases());
+    const similar = pairs
+      .map((p) => ({ p, risky: riskyWords(prompt, [p]).length }))
+      .filter((x) => x.risky > 0)
+      .slice(-3)
+      .map((x) => formatPair(x.p));
+    throw new Error(
+      `${message}\n\n[실패 분석]\n원인 추정: ${guess}\n\n${await readGuide("failure-causes.md")}` +
+        (similar.length ? `\n\n[이 프롬프트와 겹치는 과거 "실패→성공" 사례]\n${similar.join("\n")}` : ""),
+    );
+  }
+}
 
 // server.registerTool 대신 이걸 쓰면, 모든 도구 호출이 logs/ 에 자동으로 기록된다
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -110,6 +150,55 @@ register(
 );
 
 register(
+  "ps_prompt_guide",
+  {
+    title: "프롬프트 작성 가이드 · 사전 점검 (RAG)",
+    description:
+      "이미지를 생성하기 전에 호출한다. Firefly 영어 프롬프트 작성 가이드, 거절될 요소를 정직하게 바꾸는 규칙, " +
+      "그리고 이 PC 의 실제 생성 기록에서 찾은 비슷한 과거 성공·실패 사례와 '실패→고쳐서 성공' 사례를 돌려준다. " +
+      "draft(영어 초안)를 주면 과거에 실패했던 표현이 들어 있는지도 점검한다. " +
+      "사용자 요청이 한국어여도 이 결과를 참고해 영어 프롬프트를 쓴다. 포토샵을 건드리지 않고 크레딧을 쓰지 않는다.",
+    inputSchema: {
+      request: z.string().min(1).max(2000).describe("사용자의 요청 원문 (한국어 가능). 예: '비 오는 파리를 걷는 판타지 거인, 실사풍'"),
+      draft: z.string().max(2000).optional().describe("작성한 영어 프롬프트 초안 (있으면 과거 실패 표현을 점검)"),
+    },
+    annotations: { readOnlyHint: true },
+  },
+  async ({ request, draft }) => {
+    const cases = await loadCases();
+    const pairs = findRepairPairs(cases);
+    const similar = searchCases(cases, `${request} ${draft ?? ""}`, 5);
+    const risky = draft ? riskyWords(draft, pairs) : [];
+
+    const sections = [
+      "# 1. 프롬프트 작성 가이드 [프롬프트 작가]",
+      await readGuide("prompt-guide.md"),
+      "# 2. 사전 점검 · 정직한 재작성 규칙 [사전 점검]",
+      await readGuide("policy-rewrite.md"),
+      "# 3. 이 PC 의 비슷한 과거 생성 사례 (logs 검색)",
+      similar.length ? similar.map(formatCase).join("\n") : "(비슷한 사례 없음)",
+      "# 4. '실패 → 고쳐서 성공' 사례",
+      pairs.length ? pairs.slice(-5).map(formatPair).join("\n") : "(아직 없음)",
+    ];
+    if (draft) {
+      sections.push(
+        "# 5. 초안 점검",
+        risky.length
+          ? risky
+              .map((r) => `- ⚠️ "${r.word}": 과거 실패한 프롬프트에 있었고, 뺀 뒤 성공함${r.certain ? "" : " (원인 불확실)"} → 대신 쓰인 단어: ${r.replacedWith.join(", ")}`)
+              .join("\n")
+          : "- 과거 실패 기록과 겹치는 표현 없음 (그래도 2번 규칙으로 직접 점검할 것)",
+      );
+    }
+    sections.push(
+      "# 다음 순서",
+      "영어 프롬프트를 완성해 한국어 뜻과 함께 사용자에게 보여 주고, 바꾼 부분이 있으면 이유를 알린 뒤 ps_create_document → ps_generate_image.",
+    );
+    return { content: [text(sections.join("\n\n"))] };
+  },
+);
+
+register(
   "ps_create_document",
   {
     title: "새 캔버스 만들기",
@@ -147,7 +236,7 @@ register(
   async ({ prompt }) =>
     guarded(async () => {
       const generationCount = budget.reserve(`이미지 생성 "${prompt}"`); // 상한을 넘으면 여기서 멈춘다
-      const gen = await bridge.send("generateImage", { prompt });
+      const gen = await withFailureHelp(prompt, () => bridge.send("generateImage", { prompt }));
       const shown = await exportAndShow(prompt);
       return [text({ generated: gen, generationCount, savedTo: shown.path }), ...shown.content];
     }),
@@ -180,7 +269,7 @@ register(
       const generationCount = budget.reserve(
         `생성형 채우기 "${args.prompt}" @ ${args.left},${args.top},${args.right},${args.bottom}`,
       );
-      const gen = await bridge.send("generativeFill", args);
+      const gen = await withFailureHelp(args.prompt, () => bridge.send("generativeFill", args));
       const shown = await exportAndShow(args.prompt);
       return [text({ generated: gen, generationCount, savedTo: shown.path }), ...shown.content];
     }),

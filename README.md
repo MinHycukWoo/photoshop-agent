@@ -31,6 +31,7 @@ Claude에게 **"창가에 앉은 고양이를 수채화 느낌으로 만들어 �
 | 3 | 핵심 도구 (문서 생성 · 이미지 생성 · 생성형 채우기 · 레이어 · PNG 내보내기) + 호출 기록 | ✅ 완료 | [03-핵심도구](docs/progress/03-핵심도구.md) |
 | 4 | 안전장치 (생성 횟수 상한 · Origin 허용 목록 · 저장 경로 제한 · 기록) | ✅ 완료 | [04-안전장치](docs/progress/04-안전장치.md) |
 | 5 | Claude Desktop 연결 · 시나리오 테스트 | ✅ 완료 | [05-클로드데스크톱연결](docs/progress/05-클로드데스크톱연결.md) |
+| 5+ | 프롬프트 에이전트 3역할(작가 · 사전 점검 · 실패 분석) + 지식 창고(RAG) | ✅ 완료 | [05a-프롬프트에이전트와RAG](docs/progress/05a-프롬프트에이전트와RAG.md) |
 | 6 | 문서화 (`docs/README.ko.md`) | ⏳ 다음 | |
 
 ### 단계별 요약
@@ -53,11 +54,16 @@ Claude에게 **"창가에 앉은 고양이를 수채화 느낌으로 만들어 �
   생성 실패를 성공으로 보고 → **새 레이어가 있어야 성공** · 1단계 녹화 모델이 **👑 프리미엄(Image 5)** 이라 체험 횟수 소진 →
   표준 모델(`clio3` / `me_md`)로 **재녹화** · 크레딧 구매 창 등 모달 상태 안내. 설정 파일은 Store 버전에서 `Claude-Data` 폴더.
 
+- **5+단계 — 프롬프트 에이전트 + RAG:** Claude Desktop 이 MCP 서버의 작업 순서(instructions)와 지식 창고를 따라
+  ① 한국어 요청 → 영어 프롬프트 ② 캐릭터·브랜드·실존 인물 등 거절 요소를 **정직하게** 바꾸고 생성 전 확인 (필터 우회는 하지 않음)
+  ③ 실패 시 원인 추정 + 비슷한 "실패→성공" 사례 제시. 지식 창고 = `knowledge/*.md` + `logs/` 실제 생성 기록.
+
 ## MCP 도구
 
 | 도구 | 하는 일 | 상태 |
 |---|---|---|
 | `ps_status` | 연결 상태, 포토샵 버전, 열린 문서 정보 (읽기 전용) | ✅ |
+| `ps_prompt_guide` | 프롬프트 작성 가이드 · 사전 점검 규칙 · 비슷한 과거 사례 검색(RAG) · 초안의 과거 실패 표현 경고 (읽기 전용) | ✅ |
 | `ps_create_document` | 새 캔버스 생성 (64~4096px) | ✅ |
 | `ps_generate_image` | 프롬프트로 이미지 생성 → 저장 + 미리보기 반환 (⚠️ 생성형 크레딧 사용) | ✅ |
 | `ps_generative_fill` | 사각형 영역을 프롬프트로 채우기 → 저장 + 미리보기 반환 (⚠️ 생성형 크레딧 사용) | ✅ |
@@ -101,13 +107,14 @@ npm run inspector   # MCP Inspector 로 도구 테스트
 3. Inspector → Tools → 도구 선택 → *Execute Tool*
 4. 호출 기록: `logs/YYYY-MM-DD.md` (VS Code 에서 `Ctrl+Shift+V` 로 결과 이미지까지 보기)
 
-포토샵 없이 서버만 점검: `node scripts/selftest.mjs` (가짜 플러그인 · 전용 포트 18765 · 크레딧 사용 없음 · 서버 2개 동시 실행 포함 20개 항목)
+포토샵 없이 서버만 점검: `node scripts/selftest.mjs` (가짜 플러그인 · 전용 포트 18765 · 크레딧 사용 없음 · 서버 2개 동시 실행 · RAG 포함 25개 항목)
 
 ## 폴더
 
 ```
-mcp-server/    TypeScript MCP 서버 (index.ts 도구, bridge.ts 통로, output.ts 저장, logger.ts 기록, credits.ts 생성 상한)
+mcp-server/    TypeScript MCP 서버 (index.ts 도구, bridge.ts 통로, output.ts 저장, logger.ts 기록, credits.ts 생성 상한, knowledge.ts RAG)
 ps-plugin/     포토샵 UXP 플러그인 (main.js 명령 처리, firefly.js 생성형 AI batchPlay · 표준 모델)
+knowledge/     지식 창고: 프롬프트 가이드 · 정직한 재작성 규칙 · 실패 원인 (RAG 문서)
 experiments/   단계별 검증 스크립트 · 액션 녹화 원본
 docs/progress/ 단계별 작업 기록
 output/        생성 이미지 (git 제외)

@@ -6,7 +6,7 @@ const firefly = require("./firefly.js");
 const SERVER_URL = "ws://127.0.0.1:8765"; // mcp-server/config.json 의 port 와 같아야 한다
 // manifest network.domains 는 "all" 이어야 한다: 주소 지정 형식은 PS 28 에서 Permission denied (4단계에서 재검증)
 // 대신 접속 주소는 아래 SERVER_URL 하나로 고정돼 있고, 서버는 127.0.0.1 전용 + Origin 허용 목록으로 지킨다
-const BUILD = 12; // 새로 로드됐는지 확인용 (코드·manifest 를 바꿀 때마다 올린다)
+const BUILD = 13; // 새로 로드됐는지 확인용 (코드·manifest 를 바꿀 때마다 올린다)
 
 let socket = null;
 
@@ -68,7 +68,7 @@ async function runAndFindNewLayers(doc, commandName, work) {
   if (newLayers.length === 0) {
     // 원인은 포토샵이 알려 주지 않으므로 가능한 원인을 모두 알리고, 먼저 화면 확인을 부탁하게 한다
     throw new Error(
-      `생성이 실패했습니다: 포토샵이 ${seconds}초 만에 끝냈지만 새 레이어가 생기지 않았습니다. 포토샵은 이유를 알려 주지 않습니다. ` +
+      `생성이 실패했습니다: 포토샵이 ${seconds}초 만에 끝냈지만 새 레이어가 생기지 않았습니다 ("model": "${firefly.MODEL.textToImage}/${firefly.MODEL.inPainting}"). 포토샵은 이유를 알려 주지 않습니다. ` +
         "가능한 원인: ① 크레딧·체험 횟수 부족으로 포토샵에 크레딧 구매 창이 뜸 ② Firefly 콘텐츠 정책 거절(폭력·공포·실존 인물·상표 등) ③ 로그인 만료. " +
         "먼저 사용자에게 포토샵 화면에 창이나 알림이 떠 있는지 확인해 달라고 하세요. 창이 떠 있으면 닫아야 다음 명령이 실행됩니다. " +
         "창이 없었다면 표현을 순화해 다시 시도할 수 있습니다.",
@@ -162,7 +162,8 @@ const handlers = {
     const r = await runAndFindNewLayers(doc, "PS Agent: 이미지 생성", async () => {
       await play([firefly.generateImage(prompt)]);
     });
-    return { documentId: doc.id, ...r };
+    // model 을 기록해 두면, 나중에 실패 사례가 "크레딧 한도 시기"인지 구분할 수 있다 (RAG 데이터 품질)
+    return { documentId: doc.id, model: firefly.MODEL.textToImage, ...r };
   },
 
   async generativeFill({ prompt, left, top, right, bottom }) {
@@ -181,7 +182,7 @@ const handlers = {
         log(`선택 해제 실패(무시): ${e.message}`);
       }
     });
-    return { documentId: doc.id, ...r };
+    return { documentId: doc.id, model: firefly.MODEL.inPainting, ...r };
   },
 
   // 보이는 모습 그대로 PNG 로 저장해서 내용을 서버로 보낸다. 실제 파일 저장 위치는 서버가 정한다.

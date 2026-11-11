@@ -3,10 +3,11 @@
 //  ④ ps_export_png: PNG 저장 + 미리보기 이미지 반환   ⑤ 위험한 파일 이름이 output/ 밖으로 못 나가는지
 //  ⑥ logs 기록   ⑦ 생성 횟수 상한   ⑧ 잘못된 영역 거절   ⑨ 브라우저 Origin 접속 거절
 //  ⑩ 서버 2개 동시 실행(relay)   ⑪ 중계소가 꺼지면 relay 가 넘겨받기
+//  ⑫ 프롬프트 가이드(RAG)   ⑬ 생성 실패 시 실패 분석
 // 실행: npm run build 후  node scripts/selftest.mjs
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import sharp from "sharp";
@@ -16,6 +17,16 @@ import WebSocket from "ws";
 const PORT = 18765;
 // 테스트 기록은 임시 폴더에 (실제 logs/ 와 섞이지 않게)
 const LOGS = mkdtempSync(join(tmpdir(), "ps-agent-selftest-"));
+// RAG 테스트용으로 "실패 → 고쳐서 성공" 기록 한 쌍을 미리 심어 둔다 (모델이 기록된 실패 = 원인 확실)
+writeFileSync(
+  join(LOGS, "2000-01-01.jsonl"),
+  [
+    { time: "2000-01-01T00:00:00.000Z", tool: "ps_generate_image", args: { prompt: "a giant near the Eiffel Tower in Paris" }, isError: true, text: ['생성이 실패했습니다 ("model": "clio3/me_md")'] },
+    { time: "2000-01-01T00:01:00.000Z", tool: "ps_generate_image", args: { prompt: "a giant near a tall iron lattice tower on a parisian boulevard" }, isError: false, text: ['{ "seconds": 12, "model": "clio3" }'] },
+  ]
+    .map((o) => JSON.stringify(o))
+    .join("\n") + "\n",
+);
 const client = new Client({ name: "selftest", version: "0.0.1" });
 await client.connect(
   new StdioClientTransport({
@@ -35,7 +46,7 @@ const check = (label, ok, detail = "") => {
 };
 
 const tools = (await client.listTools()).tools.map((t) => t.name);
-check("① 도구 목록", tools.length === 6, tools.join(", "));
+check("① 도구 목록", tools.length === 7, tools.join(", "));
 
 const notConnected = await call("ps_status");
 check("② 미연결 안내", notConnected.content[0].text.includes("연결"), "ps_status");
@@ -50,6 +61,10 @@ const received = []; // 가짜 플러그인이 받은 명령 (포토샵까지 �
 fake.on("message", (raw) => {
   const { id, command } = JSON.parse(raw.toString());
   received.push(command);
+  // 프롬프트에 REJECT 가 있으면 Firefly 거절을 흉내 낸다 (⑬ 실패 분석 테스트용)
+  if (command === "generateImage" && String(JSON.parse(raw.toString()).params?.prompt).includes("REJECT")) {
+    return fake.send(JSON.stringify({ id, ok: false, error: "생성이 실패했습니다: 포토샵이 0.9초 만에 끝냈지만 새 레이어가 생기지 않았습니다." }));
+  }
   const result =
     command === "exportPng"
       ? { pngBase64: redPng, documentName: "fake", width: 64, height: 64 }
@@ -77,7 +92,7 @@ check("⑤ '../../evil' 도 output 안에 저장", /[\\/]output[\\/][^\\/]+\.png
 // ⑥ 호출 기록이 logs 에 남았는지 (md: 사람용, jsonl: 프로그램용)
 const logFiles = readdirSync(LOGS);
 const md = logFiles.find((f) => f.endsWith(".md"));
-const jsonl = logFiles.find((f) => f.endsWith(".jsonl"));
+const jsonl = logFiles.find((f) => f.endsWith(".jsonl") && !f.startsWith("2000")); // 미리 심은 RAG 기록은 제외
 const mdText = md ? readFileSync(join(LOGS, md), "utf8") : "";
 const lines = jsonl ? readFileSync(join(LOGS, jsonl), "utf8").trim().split("\n") : [];
 // (테스트 기록은 임시 폴더라 이미지 링크가 ../output 이 아닌 절대 경로가 된다)
@@ -134,6 +149,18 @@ const exp2 = await client2.callTool({ name: "ps_export_png", arguments: { filena
 const relayPath = exp2.content.find((c) => c.type === "text")?.text.match(/저장: (.+?\.png)/)?.[1];
 savedPaths.push(relayPath);
 check("⑩ relay 를 거쳐 PNG 내보내기", !exp2.isError && !!relayPath && existsSync(relayPath));
+
+// ⑫ 프롬프트 가이드(RAG): 가이드 문서 + 과거 사례 + 초안의 실패 표현 점검
+const guide = (await client2.callTool({ name: "ps_prompt_guide", arguments: { request: "파리를 걷는 거인", draft: "a giant walking near the Eiffel Tower" } })).content[0].text;
+check("⑫ 가이드 문서 포함 (작가·사전 점검 규칙)", guide.includes("# 1. 프롬프트 작성 가이드") && guide.includes("절대 하지 않는 것"));
+check("⑫ 과거 '실패→성공' 사례 검색", guide.includes("❌→✅") && guide.includes("lattice"));
+check("⑫ 초안의 과거 실패 표현(eiffel) 경고", /⚠️ "eiffel"/.test(guide) && !/"eiffel"[^\n]*원인 불확실/.test(guide));
+
+// ⑬ 생성 실패 시 실패 분석이 붙는다 (원인 추정 + 원인 표 + 비슷한 실패→성공 사례)
+const rejected = await client2.callTool({ name: "ps_generate_image", arguments: { prompt: "REJECT a giant near the Eiffel Tower" } });
+const rejText = rejected.content[0].text;
+check("⑬ 실패 시 [실패 분석] 첨부", rejected.isError === true && rejText.includes("[실패 분석]") && rejText.includes("원인 추정"));
+check("⑬ 비슷한 실패→성공 사례 첨부", rejText.includes("실패→성공") && rejText.includes("lattice"));
 
 // ⑪ 중계소(첫 번째 서버)가 꺼지면 relay 가 포트를 넘겨받는다
 await client.close(); // 첫 번째 서버 종료 → 가짜 플러그인 연결도 끊김
