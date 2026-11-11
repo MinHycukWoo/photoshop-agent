@@ -1,0 +1,9 @@
+﻿# 의존성 패키지 (npm install로 다시 받을 수 있음)
+node_modules/
+# 빌드 결과물
+mcp-server/dist/
+# 생성 이미지와 로그는 저장소에 올리지 않음 (폴더만 유지)
+output/*
+!output/.gitkeep
+logs/*
+!logs/.gitkeep

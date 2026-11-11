@@ -1,0 +1,153 @@
+// 1단계 검증 스크립트: 녹화한 batchPlay에서 "프롬프트만" 바꿔 다시 실행되는지 확인한다.
+// 실행 방법: 포토샵 > 파일 > 스크립트 > 찾아보기... 에서 이 파일 선택
+// ⚠️ 생성형 크레딧을 2번 사용한다 (이미지 생성 1 + 생성형 채우기 1)
+
+const { app, action, core } = require("photoshop");
+
+// 녹화본과 달라진 점은 딱 3가지:
+//  1) 프롬프트 문자열
+//  2) documentID / layerID 제거 (녹화 당시의 번호라서 지금은 맞지 않음)
+//  3) 결과 확인용 레이어 목록 출력
+const IMAGE_PROMPT = "a cat sitting by a window, watercolor";
+const FILL_PROMPT = "a small potted plant";
+
+// 지금 열린 문서의 레이어를 "이름(id, 종류)" 형태로 정리
+function layerSummary() {
+  return app.activeDocument.layers
+    .map((l) => `${l.name} (id ${l.id}, ${l.kind})`)
+    .join("\n");
+}
+
+// batchPlay는 실패해도 예외 대신 {_obj:"error"} 결과를 돌려줄 수 있어서 직접 검사한다
+function checkResult(label, result) {
+  const r = result[0];
+  if (r && r._obj === "error") {
+    throw new Error(`${label} 실패: ${r.message} (code ${r.result})`);
+  }
+}
+
+async function run() {
+  const report = [];
+
+  // ① 새 문서 (녹화본에서 documentID만 뺐다)
+  checkResult("새 문서", await action.batchPlay([{
+    _obj: "make",
+    new: {
+      _obj: "document",
+      artboard: false,
+      autoPromoteBackgroundLayer: false,
+      depth: 8,
+      fill: { _enum: "fill", _value: "white" },
+      guides: [],
+      height: { _unit: "distanceUnit", _value: 1024.0 },
+      mode: { _class: "RGBColorMode" },
+      pixelScaleFactor: 1.0,
+      profile: "none",
+      resolution: { _unit: "densityUnit", _value: 72.0 },
+      width: { _unit: "distanceUnit", _value: 1024.0 },
+    },
+  }], {}));
+  report.push(`[새 문서] id ${app.activeDocument.id}\n${layerSummary()}`);
+
+  // ② 이미지 생성 (prompt만 변경, documentID/layerID 제거)
+  let t = Date.now();
+  checkResult("이미지 생성", await action.batchPlay([{
+    _obj: "syntheticTextToImage",
+    _target: [{ _enum: "ordinal", _ref: "document", _value: "targetEnum" }],
+    prompt: IMAGE_PROMPT,
+    serviceID: "clio",
+    serviceOptionsList: {
+      clio: {
+        _obj: "clio",
+        dualCrop: true,
+        gi_CONTENT_PRESERVE: 0,
+        gi_CROP: false,
+        gi_DILATE: false,
+        gi_ENABLE_PROMPT_FILTER: true,
+        gi_GUIDANCE: 6,
+        gi_MODE: "ginp",
+        gi_NUM_STEPS: -1,
+        gi_PROMPT: "", // 녹화본에서도 비어 있었으므로 그대로 둔다
+        gi_SEED: -1,
+        gi_SIMILARITY: 0,
+      },
+    },
+    serviceVersion: "firefly_image_5",
+    workflow: "text_to_image",
+    workflowType: { _enum: "genWorkflow", _value: "text_to_image" },
+    workflow_to_active_service_identifier_map: {
+      gen_harmonize: "gen_harmonize",
+      generate_background: "clio3",
+      generate_similar: "clio3",
+      generativeUpscale: "clio_f16_async",
+      in_painting: "me_md",
+      instruct_edit: "null",
+      out_painting: "me_md",
+      prompt_to_edit: "firefly_image_5",
+      text_to_image: "firefly_image_5",
+    },
+  }], {}));
+  report.push(`[이미지 생성] ${((Date.now() - t) / 1000).toFixed(1)}초\n${layerSummary()}`);
+
+  // ③ 사각형 선택 (녹화본 그대로)
+  checkResult("선택", await action.batchPlay([{
+    _obj: "set",
+    _target: [{ _property: "selection", _ref: "channel" }],
+    to: {
+      _obj: "rectangle",
+      top: { _unit: "pixelsUnit", _value: 422.0 },
+      left: { _unit: "pixelsUnit", _value: 269.0 },
+      bottom: { _unit: "pixelsUnit", _value: 958.0 },
+      right: { _unit: "pixelsUnit", _value: 941.0 },
+    },
+  }], {}));
+
+  // ④ 생성형 채우기 (prompt와 gi_PROMPT 둘 다 변경, documentID/layerID 제거)
+  t = Date.now();
+  checkResult("생성형 채우기", await action.batchPlay([{
+    _obj: "syntheticFill",
+    _target: [{ _enum: "ordinal", _ref: "document", _value: "targetEnum" }],
+    prompt: FILL_PROMPT,
+    serviceID: "clio",
+    serviceOptionsList: {
+      clio: {
+        _obj: "clio",
+        dualCrop: true,
+        gi_CONTENT_PRESERVE: 0,
+        gi_CROP: false,
+        gi_DILATE: false,
+        gi_ENABLE_PROMPT_FILTER: true,
+        gi_GUIDANCE: 6,
+        gi_MODE: "tinp",
+        gi_NUM_STEPS: -1,
+        gi_PROMPT: FILL_PROMPT, // 채우기는 녹화본에서 여기에도 프롬프트가 있었다
+        gi_SEED: -1,
+        gi_SIMILARITY: 0,
+      },
+    },
+    serviceVersion: "firefly_image_5",
+    workflowType: { _enum: "genWorkflow", _value: "in_painting" },
+    workflow_to_active_service_identifier_map: {
+      gen_harmonize: "gen_harmonize",
+      generate_background: "clio3",
+      generate_similar: "clio3",
+      generativeUpscale: "clio_f16_async",
+      in_painting: "me_md",
+      instruct_edit: "null",
+      out_painting: "me_md",
+      prompt_to_edit: "firefly_image_5",
+      text_to_image: "firefly_image_5",
+    },
+  }], {}));
+  report.push(`[생성형 채우기] ${((Date.now() - t) / 1000).toFixed(1)}초\n${layerSummary()}`);
+
+  return report.join("\n\n");
+}
+
+// 포토샵 상태를 바꾸는 작업은 executeAsModal 안에서 해야 한다
+try {
+  const text = await core.executeAsModal(run, { commandName: "PS Agent 검증" });
+  await core.showAlert("✅ 성공\n\n" + text);
+} catch (e) {
+  await core.showAlert("❌ 실패\n\n" + (e && e.message ? e.message : String(e)));
+}
