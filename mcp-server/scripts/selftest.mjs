@@ -3,7 +3,7 @@
 //  ④ ps_export_png: PNG 저장 + 미리보기 이미지 반환   ⑤ 위험한 파일 이름이 output/ 밖으로 못 나가는지
 //  ⑥ logs 기록   ⑦ 생성 횟수 상한   ⑧ 잘못된 영역 거절   ⑨ 브라우저 Origin 접속 거절
 //  ⑩ 서버 2개 동시 실행(relay)   ⑪ 중계소가 꺼지면 relay 가 넘겨받기
-//  ⑫ 프롬프트 가이드(RAG)   ⑬ 생성 실패 시 실패 분석
+//  ⑫ 프롬프트 가이드(RAG)   ⑬ 생성 실패 시 실패 분석   ⑭ 구도 RAG   ⑮ 점검 안 받은 프롬프트 거절   ⑯ 정보 수집관 패턴
 // 실행: npm run build 후  node scripts/selftest.mjs
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -50,7 +50,7 @@ check("① 도구 목록", tools.length === 7, tools.join(", "));
 
 const notConnected = await call("ps_status");
 check("② 미연결 안내", notConnected.content[0].text.includes("연결"), "ps_status");
-const genNotConnected = await call("ps_generate_image", { prompt: "x" });
+const genNotConnected = await call("ps_generate_image", { prompt: "x", documentId: 1 });
 check("② 미연결 시 생성 도구는 오류", genNotConnected.isError === true);
 
 // 가짜 플러그인: status 와 exportPng 에 답한다 (64x64 빨간 PNG)
@@ -103,18 +103,27 @@ check("⑥ 프로그램용 기록(.jsonl) 호출 수", lines.length === 5, `${li
 // ⑦ 생성 횟수 상한 (테스트에서는 2회): 3번째는 포토샵에 보내지 않고 오류
 const savedPaths = [savedPath, evilPath];
 const pathOf = (r) => r.content.find((c) => c.type === "text")?.text.match(/"savedTo": "(.+?\.png)"/)?.[1]?.replaceAll("\\\\", "\\");
-const g1 = await call("ps_generate_image", { prompt: "one" });
-const g2 = await call("ps_generative_fill", { prompt: "two", left: 0, top: 0, right: 10, bottom: 10 });
+// ⑮ 사전 점검을 안 거친 프롬프트는 크레딧(횟수)을 쓰기 전에 거절된다
+const unchecked = await call("ps_generate_image", { prompt: "one", documentId: 1 });
+check("⑮ 점검 안 받은 프롬프트는 생성 거절", unchecked.isError === true && unchecked.content[0].text.includes("사전 점검"));
+check("⑮ 거절된 생성은 횟수를 쓰지 않음", JSON.parse((await call("ps_status")).content[0].text).generations.used === 0);
+// 점검(draft)을 거치면 생성 가능
+await call("ps_prompt_guide", { request: "테스트", draft: "one" });
+await call("ps_prompt_guide", { request: "테스트", draft: "two" });
+const g1 = await call("ps_generate_image", { prompt: "one", documentId: 1 });
+const g2 = await call("ps_generative_fill", { prompt: "two", left: 0, top: 0, right: 10, bottom: 10, documentId: 1 });
 savedPaths.push(pathOf(g1), pathOf(g2));
 check("⑦ 상한 안의 생성은 성공 (1/2, 2/2)", !g1.isError && !g2.isError && g2.content[0].text.includes('"generationCount": "2/2"'));
-const g3 = await call("ps_generate_image", { prompt: "three" });
+await call("ps_prompt_guide", { request: "테스트", draft: "three" });
+const g3 = await call("ps_generate_image", { prompt: "three", documentId: 1 });
 check("⑦ 상한을 넘은 생성은 오류", g3.isError === true && g3.content[0].text.includes("상한"));
 check("⑦ 막힌 생성은 포토샵에 전달 안 됨", received.filter((c) => c.startsWith("generat")).length === 2, received.join(","));
 const st = JSON.parse((await call("ps_status")).content[0].text);
 check("⑦ ps_status 에 남은 횟수 표시", st.generations?.remaining === 0, JSON.stringify(st.generations));
 
 // ⑧ 좌표가 뒤집힌 채우기는 횟수를 쓰기 전에 거절 (상한과 무관하게 영역 오류가 먼저)
-const bad = await call("ps_generative_fill", { prompt: "x", left: 100, top: 0, right: 50, bottom: 10 });
+await call("ps_prompt_guide", { request: "테스트", draft: "x" });
+const bad = await call("ps_generative_fill", { prompt: "x", left: 100, top: 0, right: 50, bottom: 10, documentId: 1 });
 check("⑧ 잘못된 영역은 거절", bad.isError === true && bad.content[0].text.includes("영역이 잘못"));
 
 // ⑨ Origin 허용 목록: 웹페이지(https://), 로컬 HTML 파일(null) 은 거절
@@ -156,8 +165,20 @@ check("⑫ 가이드 문서 포함 (작가·사전 점검 규칙)", guide.includ
 check("⑫ 과거 '실패→성공' 사례 검색", guide.includes("❌→✅") && guide.includes("lattice"));
 check("⑫ 초안의 과거 실패 표현(eiffel) 경고", /⚠️ "eiffel"/.test(guide) && !/"eiffel"[^\n]*원인 불확실/.test(guide));
 
+// ⑭ 구도 RAG: 사용자 말에서 촬영 기법을 찾는다 (어미가 바뀌어도: 따라가며 → 따라가는)
+const cam1 = (await client2.callTool({ name: "ps_prompt_guide", arguments: { request: "거인이 질주하는 걸 옆에서 따라가며 찍은 느낌" } })).content[0].text;
+check("⑭ '따라가며 · 질주' → 트래킹 · 팬 추천", cam1.includes("## 트래킹") && cam1.includes("## 팬"));
+const cam2 = (await client2.callTool({ name: "ps_prompt_guide", arguments: { request: "고양이 그려줘" } })).content[0].text;
+check("⑭ 구도 언급 없음 → 기본 제안 + 역동성 재료", cam2.includes("구도·촬영 기법 언급이 없음") && cam2.includes("역동성 재료"));
+
+// ⑯ 정보 수집관 RAG: 웹에서 모은 실제 사용 패턴 중 요청에 맞는 것 (출처 포함)
+const pat = (await client2.callTool({ name: "ps_prompt_guide", arguments: { request: "화장품 병 광고 사진" } })).content[0].text;
+check("⑯ '화장품 광고' → 제품 사진 패턴 + 출처", pat.includes("## 제품 사진") && /출처: https?:\/\//.test(pat));
+check("⑯ 공식 작성 원칙 항상 포함", pat.includes("## Adobe 공식 작성 원칙"));
+
 // ⑬ 생성 실패 시 실패 분석이 붙는다 (원인 추정 + 원인 표 + 비슷한 실패→성공 사례)
-const rejected = await client2.callTool({ name: "ps_generate_image", arguments: { prompt: "REJECT a giant near the Eiffel Tower" } });
+await client2.callTool({ name: "ps_prompt_guide", arguments: { request: "테스트", draft: "REJECT a giant near the Eiffel Tower" } });
+const rejected = await client2.callTool({ name: "ps_generate_image", arguments: { prompt: "REJECT a giant near the Eiffel Tower", documentId: 1 } });
 const rejText = rejected.content[0].text;
 check("⑬ 실패 시 [실패 분석] 첨부", rejected.isError === true && rejText.includes("[실패 분석]") && rejText.includes("원인 추정"));
 check("⑬ 비슷한 실패→성공 사례 첨부", rejText.includes("실패→성공") && rejText.includes("lattice"));

@@ -32,6 +32,7 @@ Claude에게 **"창가에 앉은 고양이를 수채화 느낌으로 만들어 �
 | 4 | 안전장치 (생성 횟수 상한 · Origin 허용 목록 · 저장 경로 제한 · 기록) | ✅ 완료 | [04-안전장치](docs/progress/04-안전장치.md) |
 | 5 | Claude Desktop 연결 · 시나리오 테스트 | ✅ 완료 | [05-클로드데스크톱연결](docs/progress/05-클로드데스크톱연결.md) |
 | 5+ | 프롬프트 에이전트 3역할(작가 · 사전 점검 · 실패 분석) + 지식 창고(RAG) | ✅ 완료 | [05a-프롬프트에이전트와RAG](docs/progress/05a-프롬프트에이전트와RAG.md) |
+| 5++ | 카메라·구도 RAG · 생성 흐름 바로잡기(문서 지정·레이어 맨 위·생성 전 확인) · 프롬프트 정보 수집관 | ✅ 완료 | [05b-구도RAG와정보수집관](docs/progress/05b-구도RAG와정보수집관.md) |
 | 6 | 문서화 (`docs/README.ko.md`) | ⏳ 다음 | |
 
 ### 단계별 요약
@@ -57,6 +58,9 @@ Claude에게 **"창가에 앉은 고양이를 수채화 느낌으로 만들어 �
 - **5+단계 — 프롬프트 에이전트 + RAG:** Claude Desktop 이 MCP 서버의 작업 순서(instructions)와 지식 창고를 따라
   ① 한국어 요청 → 영어 프롬프트 ② 캐릭터·브랜드·실존 인물 등 거절 요소를 **정직하게** 바꾸고 생성 전 확인 (필터 우회는 하지 않음)
   ③ 실패 시 원인 추정 + 비슷한 "실패→성공" 사례 제시. 지식 창고 = `knowledge/*.md` + `logs/` 실제 생성 기록.
+- **5++단계 — 구도 RAG · 정보 수집관:** 촬영 기법 27개(팬·틸트·트래킹·로우 앵글 등을 정지 이미지 표현으로) 를 사용자 말에서 찾아 추천해 "가운데 차렷" 구도 탈출.
+  생성은 `documentId` 필수 · 새 레이어 맨 위로 · **점검받은 프롬프트만 생성 + 생성 전 사용자 확인**.
+  Claude Code 스킬 `prompt-collector` 가 웹에서 실제 사용 패턴을 출처와 함께 수집 → `knowledge/prompt-patterns.md` (전문 복사·작가명·우회 요령은 수집 안 함).
 
 ## MCP 도구
 
@@ -107,14 +111,15 @@ npm run inspector   # MCP Inspector 로 도구 테스트
 3. Inspector → Tools → 도구 선택 → *Execute Tool*
 4. 호출 기록: `logs/YYYY-MM-DD.md` (VS Code 에서 `Ctrl+Shift+V` 로 결과 이미지까지 보기)
 
-포토샵 없이 서버만 점검: `node scripts/selftest.mjs` (가짜 플러그인 · 전용 포트 18765 · 크레딧 사용 없음 · 서버 2개 동시 실행 · RAG 포함 25개 항목)
+포토샵 없이 서버만 점검: `node scripts/selftest.mjs` (가짜 플러그인 · 전용 포트 18765 · 크레딧 사용 없음 · 서버 2개 동시 실행 · RAG 포함 31개 항목)
 
 ## 폴더
 
 ```
 mcp-server/    TypeScript MCP 서버 (index.ts 도구, bridge.ts 통로, output.ts 저장, logger.ts 기록, credits.ts 생성 상한, knowledge.ts RAG)
 ps-plugin/     포토샵 UXP 플러그인 (main.js 명령 처리, firefly.js 생성형 AI batchPlay · 표준 모델)
-knowledge/     지식 창고: 프롬프트 가이드 · 정직한 재작성 규칙 · 실패 원인 (RAG 문서)
+knowledge/     지식 창고: 프롬프트 가이드 · 정직한 재작성 · 실패 원인 · 카메라 구도 · 수집한 패턴 (RAG 문서)
+.claude/skills/prompt-collector/  프롬프트 정보 수집관 (Claude Code 스킬)
 experiments/   단계별 검증 스크립트 · 액션 녹화 원본
 docs/progress/ 단계별 작업 기록
 output/        생성 이미지 (git 제외)

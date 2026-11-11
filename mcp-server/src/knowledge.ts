@@ -30,7 +30,9 @@ export interface RepairPair {
 }
 
 // ── 문서 ──────────────────────────────────────────────
-export async function readGuide(file: "prompt-guide.md" | "policy-rewrite.md" | "failure-causes.md"): Promise<string> {
+export async function readGuide(
+  file: "prompt-guide.md" | "policy-rewrite.md" | "failure-causes.md" | "camera-composition.md" | "prompt-patterns.md",
+): Promise<string> {
   try {
     return await readFile(join(KNOWLEDGE_DIR, file), "utf8");
   } catch {
@@ -131,6 +133,64 @@ export function riskyWords(draft: string, pairs: RepairPair[]) {
     p.removedWords.filter((w) => d.has(w)).map((w) => ({ word: w, replacedWith: p.addedWords.slice(0, 6), certain: p.causeCertain, when: p.failed.time })),
   );
 }
+
+// ── 카메라·구도 검색 (camera-composition.md 를 기법별로 쪼개서 찾는다) ──
+export interface CameraTechnique {
+  group: string; // A. 카메라 움직임 등
+  title: string; // "팬 (Pan) — 패닝 샷"
+  keywords: string[];
+  body: string; // 섹션 전체 (프롬프트·효과·주의)
+}
+
+// 카메라 구도 문서와 정보 수집관 패턴 문서는 같은 형식("### 제목" + "- 키워드: …")이라 같은 방식으로 쪼갠다
+export async function loadCameraTechniques(): Promise<CameraTechnique[]> {
+  return loadSections("camera-composition.md");
+}
+
+export async function loadPromptPatterns(): Promise<CameraTechnique[]> {
+  return loadSections("prompt-patterns.md");
+}
+
+async function loadSections(file: "camera-composition.md" | "prompt-patterns.md"): Promise<CameraTechnique[]> {
+  const doc = await readGuide(file);
+  const techniques: CameraTechnique[] = [];
+  let group = "";
+  // "## " = 묶음 제목, "### " = 기법 하나
+  for (const block of doc.split(/\n(?=##+ )/)) {
+    const heading = block.match(/^(##+) (.+)/);
+    if (!heading) continue;
+    if (heading[1] === "##") {
+      group = heading[2].trim();
+      continue;
+    }
+    const kw = block.match(/- 키워드: (.+)/)?.[1] ?? "";
+    techniques.push({
+      group,
+      title: heading[2].trim(),
+      keywords: kw.split(",").map((k) => k.trim().toLowerCase()).filter(Boolean),
+      body: block.replace(/^### .+\n/, "").replace(/\n---\s*$/, "").trim(),
+    });
+  }
+  return techniques;
+}
+
+// 요청 문장에 키워드가 "들어 있는지" 로 점수를 매긴다 (한국어는 어미가 바뀌므로 포함 여부로 비교)
+export function searchCamera(techniques: CameraTechnique[], request: string, k = 4) {
+  const q = request.toLowerCase();
+  return techniques
+    .map((t) => {
+      // 한국어는 어미가 바뀌므로(따라가는/따라가며) 3글자 이상이면 마지막 글자를 뗀 어간으로도 비교한다
+      const stem = (kw: string) => (/[가-힣]$/.test(kw) && kw.length >= 3 ? kw.slice(0, -1) : kw);
+      const hits = t.keywords.filter((kw) => kw.length >= 2 && (q.includes(kw) || q.includes(stem(kw))));
+      return { ...t, hits, score: hits.length };
+    })
+    .filter((t) => t.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, k);
+}
+
+// 구도 언급이 없을 때 제안할 기본 선택지 (가운데 정면 탈출용, 서로 성격이 다른 3개)
+export const DEFAULT_CAMERA_SUGGESTIONS = ["트래킹 (Tracking / Follow)", "로우 앵글 (Low angle) / 웜즈아이", "롤 / 더치 앵글 (Roll / Dutch angle)"];
 
 // ── 사람이 읽기 좋은 형태로 ──────────────────────────
 export function formatCase(c: Case & { score?: number }): string {

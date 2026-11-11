@@ -1,12 +1,12 @@
 // PS Agent 플러그인: MCP 서버(ws://127.0.0.1:8765)에 접속해서 명령을 받아 포토샵에서 실행한다
-const { app, action, core } = require("photoshop");
+const { app, action, core, constants } = require("photoshop");
 const { storage } = require("uxp");
 const firefly = require("./firefly.js");
 
 const SERVER_URL = "ws://127.0.0.1:8765"; // mcp-server/config.json 의 port 와 같아야 한다
 // manifest network.domains 는 "all" 이어야 한다: 주소 지정 형식은 PS 28 에서 Permission denied (4단계에서 재검증)
 // 대신 접속 주소는 아래 SERVER_URL 하나로 고정돼 있고, 서버는 127.0.0.1 전용 + Origin 허용 목록으로 지킨다
-const BUILD = 13; // 새로 로드됐는지 확인용 (코드·manifest 를 바꿀 때마다 올린다)
+const BUILD = 14; // 새로 로드됐는지 확인용 (코드·manifest 를 바꿀 때마다 올린다)
 
 let socket = null;
 
@@ -26,7 +26,19 @@ function log(text) {
 }
 
 // ── 공통 도우미 ───────────────────────────────────────
-function requireDocument() {
+// documentId 가 있으면 그 문서를, 없으면 활성 문서를 쓴다.
+// 5단계에서 발견: 새 문서 만들기가 실패했는데 "활성 문서"에 생성해서 엉뚱한 그림에 들어갔다 → 생성은 문서 번호를 꼭 지정한다.
+function requireDocument(documentId) {
+  if (documentId !== undefined && documentId !== null) {
+    let found = null;
+    app.documents.forEach((d) => {
+      if (d.id === documentId) found = d;
+    });
+    if (!found) {
+      throw new Error(`문서 id ${documentId} 를 찾을 수 없습니다(닫혔을 수 있음). ps_status 로 열린 문서를 확인하고, 다른 문서에 대신 생성하지 말고 사용자에게 알리세요.`);
+    }
+    return found;
+  }
   const doc = app.activeDocument;
   if (!doc) throw new Error("열린 문서가 없습니다. ps_create_document 로 먼저 캔버스를 만들어 주세요.");
   return doc;
@@ -60,9 +72,26 @@ async function play(descriptors) {
 async function runAndFindNewLayers(doc, commandName, work) {
   const before = new Set(doc.layers.map((l) => l.id));
   const started = Date.now();
-  await core.executeAsModal(work, { commandName });
+  let created = [];
+  await core.executeAsModal(
+    async () => {
+      app.activeDocument = doc; // 지정한 문서에서 작업 (공식 DOM: activeDocument 는 읽기·쓰기)
+      await work();
+      created = doc.layers.filter((l) => !before.has(l.id));
+      // 5단계에서 발견: Firefly 는 새 레이어를 "맨 위"가 아니라 "선택된 레이어 바로 위"에 넣는다.
+      // 다른 레이어에 가려지면 저장된 PNG 에 결과가 안 보이므로 맨 위로 옮긴다. (공식 DOM: Layer.move + PLACEBEFORE = 기준 레이어 위로)
+      for (const layer of created) {
+        if (doc.layers[0].id !== layer.id) layer.move(doc.layers[0], constants.ElementPlacement.PLACEBEFORE);
+      }
+    },
+    { commandName },
+  );
   const seconds = Math.round((Date.now() - started) / 100) / 10;
-  const newLayers = doc.layers.filter((l) => !before.has(l.id)).map(describeLayer);
+  const newLayers = created.map(describeLayer);
+  // 옮긴 뒤 정말 맨 위인지 확인 (확인 못 하면 성공으로 보고하지 않는다)
+  if (created.length && doc.layers[0].id !== created[created.length - 1].id && !created.some((l) => l.id === doc.layers[0].id)) {
+    throw new Error(`새 레이어(${newLayers.map((l) => l.name).join(", ")})는 생겼지만 맨 위로 옮기지 못했습니다. 다른 레이어에 가려져 결과가 보이지 않을 수 있으니 사용자에게 레이어 패널 확인을 부탁하세요.`);
+  }
   // 5단계에서 발견: Firefly 가 요청을 거절하면 batchPlay 는 오류 없이 2초쯤 만에 끝나고 레이어만 안 생긴다.
   // "오류가 없으면 성공"이 아니라 "새 레이어가 생겨야 성공"으로 판단한다.
   if (newLayers.length === 0) {
@@ -140,14 +169,16 @@ const handlers = {
       throw new Error(
         `새 문서를 만들 수 없습니다. 포토샵 오류: ${detail}` +
           (domError ? ` (먼저 documents.add 도 실패: ${domError})` : "") +
-          ". 포토샵에 대화상자나 경고 창이 열려 있으면 다른 명령이 막히므로, 사용자에게 포토샵 화면을 확인해 달라고 요청하세요.",
+          `. 지금 열린 문서 ${app.documents.length}개. ` +
+          "⚠️ 다른 문서에 대신 생성하지 말고 여기서 멈춘 뒤 사용자에게 알리세요. " +
+          "가능한 원인: 열린 문서가 많아 탭 공간이 부족함(안 쓰는 문서를 닫아 달라고 요청), 대화상자·경고 창이 열려 있음(닫아 달라고 요청).",
       );
     });
     return { id: doc.id, name: doc.name, width: doc.width, height: doc.height, via };
   },
 
-  async listLayers() {
-    const doc = requireDocument();
+  async listLayers({ documentId }) {
+    const doc = requireDocument(documentId);
     return {
       documentId: doc.id,
       documentName: doc.name,
@@ -157,8 +188,8 @@ const handlers = {
     };
   },
 
-  async generateImage({ prompt }) {
-    const doc = requireDocument();
+  async generateImage({ prompt, documentId }) {
+    const doc = requireDocument(documentId);
     const r = await runAndFindNewLayers(doc, "PS Agent: 이미지 생성", async () => {
       await play([firefly.generateImage(prompt)]);
     });
@@ -166,8 +197,8 @@ const handlers = {
     return { documentId: doc.id, model: firefly.MODEL.textToImage, ...r };
   },
 
-  async generativeFill({ prompt, left, top, right, bottom }) {
-    const doc = requireDocument();
+  async generativeFill({ prompt, left, top, right, bottom, documentId }) {
+    const doc = requireDocument(documentId);
     if (left < 0 || top < 0 || right > doc.width || bottom > doc.height || left >= right || top >= bottom) {
       throw new Error(
         `영역이 캔버스(${doc.width}x${doc.height}) 밖이거나 잘못됐습니다: left ${left}, top ${top}, right ${right}, bottom ${bottom}`,
@@ -186,8 +217,8 @@ const handlers = {
   },
 
   // 보이는 모습 그대로 PNG 로 저장해서 내용을 서버로 보낸다. 실제 파일 저장 위치는 서버가 정한다.
-  async exportPng() {
-    const doc = requireDocument();
+  async exportPng({ documentId }) {
+    const doc = requireDocument(documentId);
     const tmp = await storage.localFileSystem.getTemporaryFolder(); // 권한 없이 쓸 수 있는 플러그인 임시 폴더
     const file = await tmp.createFile("ps-agent-export.png", { overwrite: true });
     await core.executeAsModal(

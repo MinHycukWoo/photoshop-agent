@@ -16,6 +16,10 @@
 - 사용자가 말하지 않은 것은 **분위기를 해치지 않는 선에서** 채운다. 단, 핵심(주인공·화풍·방향)은 사용자의 말을 그대로 따른다.
 - 원하지 않는 것은 "no ~" 보다 **원하는 것을 긍정형으로** 쓴다. (`empty street` > `no people`)
 - 방향·구도 요청(예: "오른쪽을 보게", "카메라 쪽으로")은 **두 번** 표현하면 더 잘 따른다: `walking toward the camera, facing the viewer`
+- **구도를 반드시 정한다.** 지정하지 않으면 "가운데에 정면으로 서 있는" 그림이 나오기 쉽다.
+  카메라 기법·앵글·샷 크기·동작 어휘는 `camera-composition.md` (ps_prompt_guide 의 "카메라·구도 추천") 를 따른다.
+- 역동성 = **동작(동사)** + **카메라 기법** + **환경 반응** 을 함께 쓴다.
+  예: `mid-stride, cloak billowing` + `tracking shot, motion-blurred ground` + `puddle splashes under each step`
 - 문장은 400자 안팎이면 충분하다. 너무 길면 뒤쪽 요소가 무시되기 쉽다.
 - 캔버스 비율과 구도를 맞춘다: 가로(16:9)면 `wide shot`, 세로면 `full-body portrait` 등.
 - **고유명사(캐릭터·브랜드·실존 인물·유명 건축물 이름)는 쓰지 않는다** → `policy-rewrite.md` 참고.
