@@ -33,6 +33,7 @@ Claude에게 **"창가에 앉은 고양이를 수채화 느낌으로 만들어 �
 | 5 | Claude Desktop 연결 · 시나리오 테스트 | ✅ 완료 | [05-클로드데스크톱연결](docs/progress/05-클로드데스크톱연결.md) |
 | 5+ | 프롬프트 에이전트 3역할(작가 · 사전 점검 · 실패 분석) + 지식 창고(RAG) | ✅ 완료 | [05a-프롬프트에이전트와RAG](docs/progress/05a-프롬프트에이전트와RAG.md) |
 | 5++ | 카메라·구도 RAG · 생성 흐름 바로잡기(문서 지정·레이어 맨 위·생성 전 확인) · 프롬프트 정보 수집관 | ✅ 완료 | [05b-구도RAG와정보수집관](docs/progress/05b-구도RAG와정보수집관.md) |
+| 5+++ | 기능 정보 수집관 · 누끼 도구(사진 열기 · 피사체/배경/원본 3레이어 · AI 배경 채우기) | ✅ 완료 (AI 제거·다듬기는 확인 전) | [05c-누끼도구와기능수집관](docs/progress/05c-누끼도구와기능수집관.md) |
 | 6 | 문서화 (`docs/README.ko.md`) | ⏳ 다음 | |
 
 ### 단계별 요약
@@ -61,6 +62,9 @@ Claude에게 **"창가에 앉은 고양이를 수채화 느낌으로 만들어 �
 - **5++단계 — 구도 RAG · 정보 수집관:** 촬영 기법 27개(팬·틸트·트래킹·로우 앵글 등을 정지 이미지 표현으로) 를 사용자 말에서 찾아 추천해 "가운데 차렷" 구도 탈출.
   생성은 `documentId` 필수 · 새 레이어 맨 위로 · **점검받은 프롬프트만 생성 + 생성 전 사용자 확인**.
   Claude Code 스킬 `prompt-collector` 가 웹에서 실제 사용 패턴을 출처와 함께 수집 → `knowledge/prompt-patterns.md` (전문 복사·작가명·우회 요령은 수집 안 함).
+- **5+++단계 — 기능 정보 수집관 · 누끼:** Claude Code 스킬 `ps-capability-collector` 가 공식 문서 · 다른 MCP 서버 · 사용 사례를 조사 → `knowledge/ps-capabilities.md`.
+  누끼 도구: `input/` 사진 열기 → **피사체(마스크) · 배경(피사체 제거) · 원본(숨김)** 3레이어, 되돌리기 1칸. 배경 채우기는 AI 제거(기본) · 생성형 채우기 · 내용 인식.
+  실사용에서 레이어 종류 비교 버그 · 같은 파일 재열기 멈춤 · Claude 가 채우기 방식을 임의로 바꿈 · 배경 프롬프트의 물건이 그려짐 등을 해결.
 
 ## MCP 도구
 
@@ -73,6 +77,8 @@ Claude에게 **"창가에 앉은 고양이를 수채화 느낌으로 만들어 �
 | `ps_generative_fill` | 사각형 영역을 프롬프트로 채우기 → 저장 + 미리보기 반환 (⚠️ 생성형 크레딧 사용) | ✅ |
 | `ps_list_layers` | 레이어 목록 (id · 이름 · 종류 · 영역) | ✅ |
 | `ps_export_png` | `output/` 에 PNG 저장 + Claude가 볼 수 있게 이미지 반환 | ✅ |
+| `ps_open_image` | `input/` 폴더의 사진 열기 (파일 이름만 · 다른 폴더 불가) | ✅ |
+| `ps_remove_background` | 누끼: 피사체 · 배경(피사체 제거) · 원본 3레이어 + PNG 2장 (AI 채우기 시 ⚠️ 크레딧) | ✅ (AI 제거·다듬기 확인 전) |
 
 ## Claude Desktop 연결
 
@@ -110,18 +116,21 @@ npm run inspector   # MCP Inspector 로 도구 테스트
 2. 포토샵 **PS Agent** 패널에서 **연결** (● 초록)
 3. Inspector → Tools → 도구 선택 → *Execute Tool*
 4. 호출 기록: `logs/YYYY-MM-DD.md` (VS Code 에서 `Ctrl+Shift+V` 로 결과 이미지까지 보기)
+5. 누끼: 사진을 `input/` 폴더에 넣고 Claude 에게 "input 폴더의 OO.jpg 누끼 따 줘"
 
-포토샵 없이 서버만 점검: `node scripts/selftest.mjs` (가짜 플러그인 · 전용 포트 18765 · 크레딧 사용 없음 · 서버 2개 동시 실행 · RAG 포함 31개 항목)
+포토샵 없이 서버만 점검: `node scripts/selftest.mjs` (가짜 플러그인 · 전용 포트 18765 · 크레딧 사용 없음 · 서버 2개 동시 실행 · RAG · 누끼 포함 46개 항목)
 
 ## 폴더
 
 ```
-mcp-server/    TypeScript MCP 서버 (index.ts 도구, bridge.ts 통로, output.ts 저장, logger.ts 기록, credits.ts 생성 상한, knowledge.ts RAG)
-ps-plugin/     포토샵 UXP 플러그인 (main.js 명령 처리, firefly.js 생성형 AI batchPlay · 표준 모델)
-knowledge/     지식 창고: 프롬프트 가이드 · 정직한 재작성 · 실패 원인 · 카메라 구도 · 수집한 패턴 (RAG 문서)
-.claude/skills/prompt-collector/  프롬프트 정보 수집관 (Claude Code 스킬)
+mcp-server/    TypeScript MCP 서버 (index.ts 도구, bridge.ts 통로, output.ts 저장, input.ts 사진 읽기, logger.ts 기록, credits.ts 생성 상한, knowledge.ts RAG)
+ps-plugin/     포토샵 UXP 플러그인 (main.js 명령 처리, firefly.js 생성형 AI batchPlay · 표준 모델, cutout.js 누끼 batchPlay)
+knowledge/     지식 창고: 프롬프트 가이드 · 정직한 재작성 · 실패 원인 · 카메라 구도 · 수집한 패턴 (RAG 문서) · 포토샵 MCP 기능 조사
+.claude/skills/prompt-collector/          프롬프트 정보 수집관 (Claude Code 스킬)
+.claude/skills/ps-capability-collector/   기능 정보 수집관 (Claude Code 스킬)
 experiments/   단계별 검증 스크립트 · 액션 녹화 원본
 docs/progress/ 단계별 작업 기록
+input/         누끼 등에 쓸 사진 (git 제외)
 output/        생성 이미지 (git 제외)
 logs/          요청/결과 로그 (git 제외)
 ```

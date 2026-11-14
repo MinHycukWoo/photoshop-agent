@@ -24,4 +24,18 @@ export class GenerationBudget {
     log(`생성 ${this.used}/${this.limit}: ${what}`);
     return `${this.used}/${this.limit}`;
   }
+
+  // 한 번의 도구 호출이 생성을 여러 번 할 때(예: 누끼 AI 제거 + AI 다듬기): 남은 횟수가 모자라면 하나도 쓰지 않고 거절
+  reserveMany(count: number, what: string): string | undefined {
+    if (count <= 0) return undefined;
+    if (this.limit - this.used < count) {
+      throw new Error(
+        `생성 횟수 상한(${this.limit}회, 남은 ${this.limit - this.used}회)이 모자라 ${what}(${count}회 필요)을(를) 실행하지 않았습니다. ` +
+          `크레딧 보호용 제한입니다. 계속하려면 사용자가 mcp-server/config.json 의 maxGenerationsPerRun 을 늘리거나 MCP 서버(Claude Desktop)를 다시 시작해야 합니다.`,
+      );
+    }
+    let last = "";
+    for (let i = 0; i < count; i++) last = this.reserve(what);
+    return last;
+  }
 }

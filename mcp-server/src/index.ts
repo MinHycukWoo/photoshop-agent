@@ -5,6 +5,7 @@ import { z } from "zod";
 import { loadConfig } from "./config.js";
 import { PhotoshopBridge, NOT_CONNECTED_MESSAGE, log } from "./bridge.js";
 import { savePng } from "./output.js";
+import { readInputImage, listInputImages, INPUT_DIR } from "./input.js";
 import { logCall } from "./logger.js";
 import { GenerationBudget } from "./credits.js";
 import {
@@ -44,7 +45,24 @@ const INSTRUCTIONS = `Photoshop 생성형 AI 작업 순서 (반드시 이 순서
    ps_create_document 가 실패하면 다른 문서에 대신 생성하지 말고 멈춘 뒤 사용자에게 원인과 해결 방법을 알린다.
 5) [실패 분석] 생성이 실패하면 오류에 붙은 "실패 분석" 을 따른다. 먼저 포토샵 화면에 창이 떠 있는지 사용자에게 확인하고,
    콘텐츠 정책 거절로 보일 때만 2) 규칙으로 고친 프롬프트를 다시 점검·확인받아 재시도한다.
-6) 결과 미리보기 이미지를 보고 요청(특히 구도·동작)과 비교해, 다른 점이 있으면 솔직하게 알린다.`;
+6) 결과 미리보기 이미지를 보고 요청(특히 구도·동작)과 비교해, 다른 점이 있으면 솔직하게 알린다.
+
+누끼(배경 제거) 작업은 위 1)~3) 이 필요 없다 (프롬프트 없음, 크레딧 0):
+a) 사용자가 사진 파일을 말하면 ps_open_image(filename) 로 연다. 사진은 input/ 폴더에 있어야 한다.
+   다시 시도할 때는 같은 사진을 또 열지 말고, ps_status 로 이미 열린 문서가 있는지 보고 그 id 를 쓴다.
+   채팅에 첨부한 이미지는 도구로 넘길 수 없으니, 그런 경우 input 폴더에 넣어 달라고 안내한다. 파일 이름을 모르면 filename 없이 호출해 목록을 본다.
+b) 그 결과의 id 로 ps_remove_background(documentId) 를 호출한다. 문서에는 "피사체" · "배경 (피사체 제거)" · "원본(숨김)" 세 레이어가 생긴다.
+   배경 채우기는 AI 제거(remove: 주변을 보고 "없던 것처럼" 메움)가 기본이고 사용자가 원하는 방식이다. backgroundFill 은 생략한다.
+   사용자가 직접 요청했을 때만 다른 값을 쓴다: 생성형 채우기(generative) / 무료·내용 인식(contentAware) / 채우지 않음(none).
+   배경이 단순해 보여도 스스로 바꾸지 않는다. backgroundPrompt 에 물건 이름(문·바닥 등)을 쓰면 AI 가 그 물건을 새로 그려 넣으니 쓰지 않는다.
+   답할 때 결과의 backgroundFill.method(실제로 쓴 채우기 방식)를 사용자에게 알린다.
+   배경 미리보기에 잔머리·그림자·얼룩이 남았으면 솔직히 말하고, 다시 할지 묻는다. 다시 할 때는 사진을 새로 열고
+   expandPercent 를 올리거나(예: 3~4) 배경만 짧게 묘사한 backgroundPrompt(점검 후)를 넣는다.
+   기본으로 AI 제거 뒤 "다듬기"(refine: 같은 영역을 생성형 채우기로 한 번 더)까지 해서 크레딧이 2회 든다. 사용자가 다듬기 없이 하라고 하면 refine=false.
+   결과의 backgroundFill.pass1 / pass2 로 각 단계가 실제로 돌았는지 확인해 알려 준다.
+   AI 채우기가 실패하면(누끼도 함께 되돌려짐) 포토샵 화면의 창부터 확인받고, 다른 방식으로 다시 할지 묻는다.
+c) 미리보기(회색 = 투명)를 보고 경계(머리카락·손가락·투명한 물체), 빠진 부분, 남은 배경을 솔직하게 알린다.
+   마스크 방식이라 원본은 지워지지 않았고, 포토샵에서 Ctrl+Z 한 번으로 되돌리거나 마스크를 브러시로 고칠 수 있다고 알려 준다.`;
 
 // 사전 점검(ps_prompt_guide 의 draft)을 거친 프롬프트만 생성할 수 있게 기록해 둔다
 const checkedPrompts = new Set<string>();
@@ -128,9 +146,14 @@ async function guarded(work: () => Promise<Content[]>) {
 }
 
 // 현재 문서를 PNG 로 받아 output/ 에 저장하고, [설명 텍스트, 미리보기 이미지] 를 만든다
-async function exportAndShow(name: string, documentId?: number): Promise<{ path: string; content: Content[] }> {
-  const r = (await bridge.send("exportPng", { documentId })) as { pngBase64: string; documentName: string; width: number; height: number };
-  const saved = await savePng(r.pngBase64, name || r.documentName);
+async function exportAndShow(
+  name: string,
+  documentId?: number,
+  previewBackground?: string,
+  hideLayerIds?: number[], // 저장하는 동안만 숨길 레이어
+): Promise<{ path: string; content: Content[] }> {
+  const r = (await bridge.send("exportPng", { documentId, hideLayerIds })) as { pngBase64: string; documentName: string; width: number; height: number };
+  const saved = await savePng(r.pngBase64, name || r.documentName, previewBackground);
   return {
     path: saved.path,
     content: [
@@ -145,6 +168,10 @@ async function exportAndShow(name: string, documentId?: number): Promise<{ path:
     ],
   };
 }
+
+// 누끼 배경 "다듬기"의 기본 문구: 물건 이름 없이 "주변을 이어 붙이라"는 말만 한다
+// (빌드 20 실사용: 배경 설명에 "문틀·바닥"을 넣었더니 작은 문·선반을 새로 그렸다)
+const DEFAULT_REFINE_PROMPT = "seamless continuation of the surrounding background, matching texture, color and lighting, clean and empty";
 
 const prompt = z
   .string()
@@ -395,6 +422,120 @@ register(
     guarded(async () => {
       const shown = await exportAndShow(filename ?? "", documentId);
       return shown.content;
+    }),
+);
+
+register(
+  "ps_open_image",
+  {
+    title: "사진 열기 (input 폴더)",
+    description:
+      `프로젝트의 input 폴더(${INPUT_DIR})에 있는 사진을 포토샵에서 새 문서로 연다. 누끼 따기 등 기존 사진을 편집할 때 첫 단계로 쓴다. ` +
+      "filename 을 비우면 열지 않고 폴더 안의 사진 목록만 돌려준다. 다른 폴더의 파일은 열 수 없다(안전장치). " +
+      "결과의 id 를 다음 도구의 documentId 로 넘긴다. 크레딧을 쓰지 않는다.",
+    inputSchema: {
+      filename: z.string().max(200).optional().describe("input 폴더 안의 파일 이름 (예: 'cat.jpg'). 폴더 경로는 쓸 수 없다"),
+    },
+  },
+  async ({ filename }) => {
+    if (!filename) {
+      // 목록 보기는 포토샵 연결 없이도 된다
+      const files = await listInputImages();
+      return { content: [text({ inputFolder: INPUT_DIR, images: files })] };
+    }
+    return guarded(async () => {
+      const img = await readInputImage(filename); // 잘못된 이름·없는 파일은 포토샵에 보내기 전에 거절
+      const opened = await bridge.send("openImage", { fileName: img.fileName, dataBase64: img.dataBase64 });
+      return [text({ opened, sourceFile: img.fileName, bytes: img.bytes })];
+    });
+  },
+);
+
+register(
+  "ps_remove_background",
+  {
+    title: "누끼 따기 (배경 제거)",
+    description:
+      "사진 레이어에서 피사체(사람·동물·물건)를 찾아 세 레이어로 나눈다: " +
+      "위 '피사체'(원본 복제 + 레이어 마스크), 가운데 '배경 (피사체 제거)'(피사체 자리를 채운 배경), 아래 '원본'(숨김). " +
+      "원본 픽셀은 지우지 않으므로 마스크를 고치거나 Ctrl+Z 한 번으로 전부 되돌릴 수 있다. " +
+      "피사체만 / 배경만 각각 PNG 로 output/ 에 저장하고 미리보기 2장(피사체는 회색 = 투명)을 돌려준다. " +
+      "backgroundFill: 'remove'(기본, AI 제거 — 주변에 맞춰 없던 것처럼 메움, 크레딧 사용으로 간주) / 'generative'(AI 생성형 채우기 — 크레딧 1회, 뭔가를 그려 넣는 경향) / " +
+      "'contentAware'(내용 인식 채우기 — 크레딧 없음, 넓은 영역은 얼룩지기 쉬움) / 'none'(채우지 않음). " +
+      "⚠️ backgroundFill 은 생략해서 기본값(remove)을 쓴다. 사용자가 직접 다른 방식을 말했을 때만 다른 값을 넣는다. 배경이 단순해 보여도 스스로 바꾸지 않는다. " +
+      "배경은 피사체 영역을 expandPercent(기본 2%)만큼 넓혀서 채운다 — 잔머리·벽에 진 그림자가 남으면 값을 올린다. " +
+      "backgroundPrompt 는 generative 에서만 쓰인다. 비우면 주변에 맞춰 채우고, 넣으면 그 내용을 그려 넣는다(ps_prompt_guide 사전 점검 필요). " +
+      "레이어가 하나뿐인 문서(ps_open_image 로 연 사진)는 layerId 를 생략한다. 레이어가 여럿이면 ps_list_layers 로 확인해 layerId 를 지정한다.",
+    inputSchema: {
+      documentId: z.number().int().describe("문서 id (ps_open_image 결과의 id)"),
+      layerId: z.number().int().optional().describe("누끼를 딸 레이어 id (레이어가 하나면 생략)"),
+      backgroundFill: z
+        .enum(["remove", "generative", "contentAware", "none"])
+        .default("remove")
+        .describe("피사체가 빠진 배경 자리 채우기: remove(AI 제거, 기본) / generative(AI 생성형 채우기) / contentAware(무료) / none"),
+      expandPercent: z.number().min(0).max(10).default(2).describe("배경을 채울 때 피사체 영역을 넓히는 정도 (긴 변 대비 %, 기본 2)"),
+      backgroundPrompt: z
+        .string()
+        .max(300)
+        .optional()
+        .describe("generative 1차 채우기에 쓸 설명 (선택, 영어). 물건 이름(문·바닥 등)을 쓰면 그 물건을 새로 그려 넣으니 표면·질감만. 예: 'smooth plain painted wall surface'"),
+      refine: z
+        .boolean()
+        .default(true)
+        .describe("AI 로 배경을 채운 뒤 같은 영역을 생성형 채우기로 한 번 더 다듬을지 (기본 true, 크레딧 1회 추가)"),
+      refinePrompt: z
+        .string()
+        .max(300)
+        .optional()
+        .describe("다듬기 프롬프트 (선택, 영어). 생략하면 기본 문구(주변 배경의 자연스러운 연장). 물건 이름은 쓰지 않는다"),
+      filename: z.string().max(60).optional().describe("저장할 PNG 이름 (선택). 생략하면 '문서이름_피사체' / '문서이름_배경'"),
+    },
+  },
+  async ({ documentId, layerId, backgroundFill, expandPercent, backgroundPrompt, refine, refinePrompt, filename }) =>
+    guarded(async () => {
+      const ai = backgroundFill === "generative" || backgroundFill === "remove";
+      const doRefine = ai && refine;
+      // 프롬프트를 직접 쓰면 생성 규칙과 같게 사전 점검 (기본 다듬기 문구는 서버가 정한 고정 문구라 점검 불필요)
+      if (backgroundPrompt && backgroundFill === "generative") requireChecked(backgroundPrompt);
+      if (refinePrompt && doRefine) requireChecked(refinePrompt);
+      // AI 제거도 크레딧을 쓰는지 확인되지 않아 보수적으로 센다. 다듬기까지 하면 2회 — 모자라면 하나도 쓰지 않고 거절
+      const generationCount = budget.reserveMany((ai ? 1 : 0) + (doRefine ? 1 : 0), `누끼 배경 AI(${backgroundFill}${doRefine ? " + 다듬기" : ""})`);
+      const r = (await bridge.send("removeBackground", {
+        documentId,
+        layerId,
+        backgroundFill,
+        expandPercent,
+        backgroundPrompt: backgroundPrompt ?? "",
+        refine: doRefine,
+        refinePrompt: refinePrompt || DEFAULT_REFINE_PROMPT,
+      })) as {
+        documentName: string;
+        subjectCoveragePercent: number | null;
+        subjectLayer?: { id: number };
+        backgroundLayer?: { id: number };
+        extraBackgroundLayerIds?: number[];
+      };
+      const baseName = filename || r.documentName.replace(/\.[^.]+$/, ""); // "고양이.jpg" → "고양이"
+      const bgIds = [...(r.backgroundLayer ? [r.backgroundLayer.id] : []), ...(r.extraBackgroundLayerIds ?? [])];
+      // 저장하는 동안만 다른 쪽을 숨긴다 (원본은 이미 숨겨져 있음)
+      const subjectShot = await exportAndShow(`${baseName}_피사체`, documentId, "#808080", bgIds);
+      const bgShot = await exportAndShow(`${baseName}_배경`, documentId, undefined, r.subjectLayer ? [r.subjectLayer.id] : []);
+      const note =
+        r.subjectCoveragePercent !== null && (r.subjectCoveragePercent < 3 || r.subjectCoveragePercent > 97)
+          ? `⚠️ 마스크에서 보이는 부분이 ${r.subjectCoveragePercent}% 뿐이라 피사체를 제대로 못 잡았을 수 있다. 미리보기를 꼭 확인할 것.`
+          : undefined;
+      return [
+        text({
+          cutout: r,
+          ...(generationCount ? { generationCount } : {}),
+          savedTo: { subject: subjectShot.path, background: bgShot.path },
+          ...(note ? { warning: note } : {}),
+        }),
+        text("① 피사체 (회색 = 투명)"),
+        ...subjectShot.content,
+        text("② 배경 (피사체 제거)"),
+        ...bgShot.content,
+      ];
     }),
 );
 

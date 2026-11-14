@@ -7,3 +7,6 @@ output/*
 !output/.gitkeep
 logs/*
 !logs/.gitkeep
+# 누끼 등에 쓸 사진 (개인 사진이라 저장소에 올리지 않음, 폴더만 유지)
+input/*
+!input/.gitkeep

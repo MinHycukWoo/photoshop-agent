@@ -2,11 +2,12 @@
 const { app, action, core, constants } = require("photoshop");
 const { storage } = require("uxp");
 const firefly = require("./firefly.js");
+const cutout = require("./cutout.js");
 
 const SERVER_URL = "ws://127.0.0.1:8765"; // mcp-server/config.json 의 port 와 같아야 한다
 // manifest network.domains 는 "all" 이어야 한다: 주소 지정 형식은 PS 28 에서 Permission denied (4단계에서 재검증)
 // 대신 접속 주소는 아래 SERVER_URL 하나로 고정돼 있고, 서버는 127.0.0.1 전용 + Origin 허용 목록으로 지킨다
-const BUILD = 14; // 새로 로드됐는지 확인용 (코드·manifest 를 바꿀 때마다 올린다)
+const BUILD = 22; // 새로 로드됐는지 확인용 (코드·manifest 를 바꿀 때마다 올린다)
 
 let socket = null;
 
@@ -120,6 +121,36 @@ function toBase64(arrayBuffer) {
   return out;
 }
 
+// base64 → ArrayBuffer (toBase64 의 반대)
+function fromBase64(text) {
+  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  const clean = text.replace(/[^A-Za-z0-9+/]/g, ""); // '=' 와 줄바꿈 제거
+  const bytes = new Uint8Array(Math.floor((clean.length * 3) / 4));
+  let j = 0;
+  for (let i = 0; i < clean.length; i += 4) {
+    const n =
+      (chars.indexOf(clean[i]) << 18) |
+      (chars.indexOf(clean[i + 1]) << 12) |
+      ((i + 2 < clean.length ? chars.indexOf(clean[i + 2]) : 0) << 6) |
+      (i + 3 < clean.length ? chars.indexOf(clean[i + 3]) : 0);
+    bytes[j++] = (n >> 16) & 255;
+    if (i + 2 < clean.length) bytes[j++] = (n >> 8) & 255;
+    if (i + 3 < clean.length) bytes[j++] = n & 255;
+  }
+  return bytes.buffer.slice(0, j);
+}
+
+// 레이어 픽셀의 "지문": 작은 썸네일(높이 64)을 읽어 숫자 하나로 요약한다 (공식 Imaging API, 모달 안에서 불러야 함)
+// 작업 전후 지문이 다르면 픽셀이 바뀐 것
+async function layerSignature(doc, layer) {
+  const px = await require("photoshop").imaging.getPixels({ documentID: doc.id, layerID: layer.id, targetSize: { height: 64 } });
+  const data = await px.imageData.getData();
+  let hash = 0;
+  for (let i = 0; i < data.length; i++) hash = (hash * 31 + data[i]) % 1000000007;
+  px.imageData.dispose();
+  return hash;
+}
+
 // ── 명령 처리기: MCP 서버가 보낼 수 있는 명령은 여기 있는 것뿐이다 ──
 // (임의 코드를 실행하는 명령은 일부러 만들지 않는다)
 const handlers = {
@@ -216,14 +247,251 @@ const handlers = {
     return { documentId: doc.id, model: firefly.MODEL.inPainting, ...r };
   },
 
+  // 사진 열기: 서버가 input/ 폴더에서 읽어 보낸 파일을 플러그인 임시 폴더에 쓰고 포토샵으로 연다.
+  // (임시 폴더는 추가 권한 없이 쓸 수 있어서 manifest 를 바꾸지 않아도 된다. 공식 DOM: app.open(entry))
+  async openImage({ fileName, dataBase64 }) {
+    const tmp = await storage.localFileSystem.getTemporaryFolder();
+    // 실사용에서 발견(빌드 16): 같은 사진을 두 번 열면, 포토샵에 열려 있는 임시 파일을 덮어쓰고 다시 열게 되어
+    // 포토샵이 응답하지 않았다(상태 확인까지 120초 멈춤). → 열 때마다 새 폴더를 만들어 파일이 서로 부딪히지 않게 한다.
+    // (문서 이름은 원래 파일 이름 그대로 보인다)
+    const folder = await tmp.createFolder(`open-${Date.now()}`);
+    const file = await folder.createFile(fileName, { overwrite: true }); // 이름은 서버가 안전하게 정리해서 보낸다
+    await file.write(fromBase64(dataBase64), { format: storage.formats.binary });
+    let doc;
+    await core.executeAsModal(
+      async () => {
+        doc = await app.open(file);
+      },
+      { commandName: "PS Agent: 사진 열기" },
+    ).catch((e) => {
+      throw new Error(
+        `사진을 열 수 없습니다. 포토샵 오류: ${e && e.message ? e.message : e}. ` +
+          "가능한 원인: 포토샵이 지원하지 않는 형식이거나 파일이 손상됨, 대화상자가 열려 있음, 열린 문서가 너무 많음.",
+      );
+    });
+    return { id: doc.id, name: doc.name, width: doc.width, height: doc.height, layers: doc.layers.map(describeLayer) };
+  },
+
+  // 누끼: 피사체 선택 → 레이어 마스크 (원본 픽셀은 지우지 않고 가린다 → 나중에 마스크를 고칠 수 있다)
+  // backgroundFill: 피사체가 빠진 자리를 어떻게 채울지 — "remove"(AI 제거, 기본) / "generative"(AI 생성형 채우기) / "contentAware"(내용 인식, 무료) / "none"
+  // refine: 1차 AI 뒤에 같은 영역을 생성형 채우기(refinePrompt)로 한 번 더 다듬는다 (사용자 요청, 크레딧 1회 추가)
+  async removeBackground({
+    documentId,
+    layerId,
+    backgroundFill = "remove",
+    expandPercent = 2,
+    backgroundPrompt = "",
+    refine = false,
+    refinePrompt = "",
+  }) {
+    const doc = requireDocument(documentId);
+    let layer = null;
+    if (layerId !== undefined && layerId !== null) {
+      layer = doc.layers.filter((l) => l.id === layerId)[0] || null; // (기존 코드처럼 filter 사용: 컬렉션에 find 가 있는지 미확인)
+      if (!layer) throw new Error(`레이어 id ${layerId} 를 찾을 수 없습니다. ps_list_layers 로 확인하세요.`);
+    } else if (doc.layers.length === 1) {
+      layer = doc.layers[0];
+    } else {
+      throw new Error(
+        `이 문서에는 레이어가 ${doc.layers.length}개라 어느 레이어의 누끼를 딸지 정할 수 없습니다. ` +
+          "ps_list_layers 로 확인한 뒤 layerId 를 지정하세요.",
+      );
+    }
+    // 실사용에서 발견(빌드 15): layer.kind 는 "pixel" 같은 글자인데 constants.LayerKind.PIXEL 과 같지 않아 정상 사진도 거절됐다.
+    // → 실제로 돌아오는 글자와 직접 비교한다 (대소문자 무시: 스마트 오브젝트는 "smartObject")
+    const kind = String(layer.kind).toLowerCase();
+    if (kind !== "pixel" && kind !== "smartobject") {
+      throw new Error(`"${layer.name}" 은 ${layer.kind} 레이어라 누끼를 딸 수 없습니다. 사진(픽셀) 레이어를 지정하세요.`);
+    }
+
+    // 결과는 세 레이어 (사용자 요청: 원본 · 누끼 딴 피사체 · 피사체가 제거된 배경이 각각 있어야 한다)
+    //   위   "피사체"              원본 복제 + 레이어 마스크
+    //   가운데 "배경 (피사체 제거)"   원본 복제에서 피사체 자리를 채움
+    //   아래  "원본"                손대지 않음, 숨김
+    const started = Date.now();
+    let subject = null;
+    let cleanBg = null;
+    let original = null;
+    let subjectBounds = null;
+    let coverage = null;
+    let fillInfo = { method: backgroundFill, refine };
+
+    // AI 한 번 실행 + 결과 확인 + 배경에 합치기 (현재 선택 영역, 현재 레이어 = cleanBg 기준)
+    // kind: "remove" | "generative". 모달 안에서만 부른다.
+    const aiPass = async (kind, prompt) => {
+      const info = { kind };
+      const label = kind === "remove" ? "AI 제거(Remove)" : "AI 생성형 채우기";
+      doc.activeLayers = [cleanBg];
+      const before = new Set(doc.layers.map((l) => l.id));
+      // 제거는 결과가 새 레이어 없이 현재 레이어를 직접 고칠 수도 있어서, 전후 픽셀을 비교해 성공을 판정한다
+      const beforeSig = await layerSignature(doc, cleanBg);
+      const t0 = Date.now();
+      if (kind === "remove") {
+        await play([cutout.removeButton()]);
+      } else {
+        await play([firefly.generativeFill(prompt)]);
+        info.prompt = prompt;
+        info.model = firefly.MODEL.inPainting;
+      }
+      const created = doc.layers.filter((l) => !before.has(l.id));
+      info.seconds = Math.round((Date.now() - t0) / 100) / 10;
+      info.newLayer = created.length > 0; // 결과가 새 레이어로 나오는지 기록 (제거 버튼은 처음 확인하는 동작)
+      if (created.length === 0) {
+        if ((await layerSignature(doc, cleanBg)) === beforeSig) {
+          // 5단계와 같은 "거짓 성공" 판정: 결과가 없으면 실패 (예외 → 누끼까지 모두 되돌림)
+          throw new Error(
+            `${label}가 실패했습니다: 포토샵이 ${info.seconds}초 만에 끝냈지만 새 레이어도, 배경의 변화도 없습니다. 누끼도 함께 되돌렸습니다. ` +
+              "가능한 원인: ① 크레딧 부족으로 구매 창이 뜸 ② 로그인 만료 ③ Firefly 거절. 먼저 포토샵 화면에 창이 떠 있는지 사용자에게 확인하세요. " +
+              "다른 방식(backgroundFill 변경, refine 끄기)으로 다시 시도할 수 있습니다.",
+          );
+        }
+        info.merged = "배경 레이어가 직접 바뀜";
+        return info;
+      }
+      // 생성된 레이어(마스크 달린 Generative Layer)를 배경에 합쳐 한 장으로 만든다 (공식 DOM: Layer.merge = 아래 레이어와 병합)
+      const gen = created[0];
+      try {
+        doc.activeLayers = [gen];
+        cleanBg = await gen.merge();
+        cleanBg.name = "배경 (피사체 제거)";
+        info.merged = true;
+      } catch (e) {
+        // 합치지 못하면 따로 둔다 (결과는 같다: 배경 위에 채운 부분이 덮인다)
+        gen.name = "배경 채움 (AI)";
+        info.merged = false;
+        info.mergeError = e.message;
+        log(`AI 채움 레이어 병합 실패(따로 둠): ${e.message}`);
+      }
+      return info;
+    };
+
+    await core.executeAsModal(
+      async (ctx) => {
+        app.activeDocument = doc;
+        // 여러 단계를 히스토리 1칸으로 묶는다 → 사용자가 Ctrl+Z 한 번으로 되돌릴 수 있다 (공식: hostControl.suspendHistory)
+        // 중간에 예외가 나면 묶음이 취소되어 원래대로 돌아간다
+        const historyId = await ctx.hostControl.suspendHistory({ documentID: doc.id, name: "PS Agent: 누끼" });
+        doc.activeLayers = [layer]; // 녹화 명령은 "현재 레이어"에 적용되므로 대상 레이어를 선택해 둔다 (공식 DOM, 26.9+)
+        if (layer.isBackgroundLayer) await play([cutout.convertBackgroundToLayer()]); // 잠긴 배경엔 마스크를 못 단다
+        original = doc.activeLayers[0];
+        original.name = "원본";
+        cleanBg = await original.duplicate(); // 공식 DOM: 복제본은 원래 레이어 바로 위에 생긴다
+        cleanBg.name = "배경 (피사체 제거)";
+        subject = await cleanBg.duplicate();
+        subject.name = "피사체";
+        doc.activeLayers = [subject];
+
+        await play([cutout.selectSubject()]); // 현재 레이어(피사체 복제본)만 보고 찾는다
+        const b = doc.selection.bounds;
+        if (!b || b.right - b.left < 1 || b.bottom - b.top < 1) {
+          throw new Error("피사체를 찾지 못했습니다(선택 영역이 비어 있음). 피사체가 뚜렷한 사진인지 확인해 주세요.");
+        }
+        subjectBounds = { left: b.left, top: b.top, right: b.right, bottom: b.bottom };
+        await play([cutout.maskFromSelection()]);
+        await doc.selection.deselect();
+
+        // 성공 판정은 "오류 없음"이 아니라 "마스크가 실제로 생겼는지"로 한다 (공식 Imaging API: getLayerMask)
+        // 실사용에서 발견(빌드 17): 모달 밖에서 부르면 실패한다 → 모달 안에서 확인
+        try {
+          const mask = await require("photoshop").imaging.getLayerMask({
+            documentID: doc.id,
+            layerID: subject.id,
+            targetSize: { height: 64 }, // 확인용이라 작게
+          });
+          const data = await mask.imageData.getData();
+          let shown = 0;
+          for (const v of data) if (v > 127) shown++;
+          coverage = Math.round((shown / data.length) * 100); // 마스크에서 "보이는" 부분의 비율
+          mask.imageData.dispose();
+        } catch (e) {
+          throw new Error(`피사체 선택은 됐지만 레이어 마스크를 확인할 수 없어 되돌렸습니다: ${e.message}`);
+        }
+
+        // 배경 레이어에서 피사체 자리를 채운다
+        if (backgroundFill !== "none") {
+          doc.activeLayers = [cleanBg];
+          await play([cutout.selectSubject()]); // 같은 픽셀이라 피사체 레이어와 같은 영역이 잡힌다
+          // 선택을 넓혀서 채운다 — 공식 DOM: Selection.expand
+          // 실사용에서 발견(빌드 19): 0.5%(14px)로는 잔머리·벽에 진 그림자가 선택 밖에 남아 배경에 얼룩으로 남았다 → 기본 2%
+          const grow = Math.max(4, Math.round((Math.max(doc.width, doc.height) * expandPercent) / 100));
+          await doc.selection.expand(grow);
+          fillInfo.expandedPx = grow;
+
+          // 다듬기(2차 AI)에서 같은 영역을 다시 쓰려고 선택 영역을 보관한다 (1차 뒤엔 피사체가 지워져 다시 선택할 수 없다)
+          // 공식 Imaging API: getSelection / putSelection
+          let savedSelection = null;
+          if (refine && backgroundFill !== "contentAware") {
+            try {
+              savedSelection = await require("photoshop").imaging.getSelection({ documentID: doc.id });
+            } catch (e) {
+              fillInfo.refineSkipped = `선택 영역을 보관하지 못함: ${e.message}`;
+            }
+          }
+
+          if (backgroundFill === "contentAware") {
+            await play([cutout.contentAwareFill()]); // 레이어 픽셀을 직접 채움 (크레딧 없음)
+          } else {
+            // 1차 AI:
+            //  - "remove": 제거(Remove) 버튼 — 지우기 전용 AI. 주변에 맞춰 "없던 것처럼" 메운다 (gen-remove 녹화)
+            //  - "generative": 생성형 채우기 — 1단계에서 검증. 빈 프롬프트면 주변에 맞춰 채우지만, 뭔가를 그려 넣는 경향이 있었다(빌드 19~20)
+            fillInfo.pass1 = await aiPass(backgroundFill, backgroundPrompt);
+
+            // 2차 AI (다듬기): 같은 영역을 생성형 채우기로 "주변과 이어지게" 다시 그린다 (사용자 요청)
+            if (refine && savedSelection) {
+              doc.activeLayers = [cleanBg];
+              if (!doc.selection.bounds) {
+                try {
+                  await require("photoshop").imaging.putSelection({ documentID: doc.id, imageData: savedSelection.imageData });
+                } catch (e) {
+                  fillInfo.refineSkipped = `선택 영역을 되살리지 못함: ${e.message}`;
+                }
+              }
+              if (doc.selection.bounds) fillInfo.pass2 = await aiPass("generative", refinePrompt);
+            }
+          }
+          if (savedSelection) savedSelection.imageData.dispose();
+          await doc.selection.deselect();
+        }
+        original.visible = false; // 원본은 보관용으로 숨긴다
+        doc.activeLayers = [subject];
+        await ctx.hostControl.resumeHistory(historyId);
+      },
+      { commandName: "PS Agent: 누끼" },
+    );
+    // AI 채움 레이어를 따로 둔 경우 그 레이어도 "배경" 쪽으로 본다
+    const extraBgLayers = doc.layers.filter((l) => l.name === "배경 채움 (AI)").map((l) => l.id);
+    return {
+      documentId: doc.id,
+      documentName: doc.name,
+      seconds: Math.round((Date.now() - started) / 100) / 10,
+      subjectLayer: describeLayer(subject),
+      backgroundLayer: describeLayer(cleanBg),
+      originalLayer: describeLayer(original),
+      extraBackgroundLayerIds: extraBgLayers,
+      backgroundFill: fillInfo,
+      subjectBounds,
+      subjectCoveragePercent: coverage,
+    };
+  },
+
   // 보이는 모습 그대로 PNG 로 저장해서 내용을 서버로 보낸다. 실제 파일 저장 위치는 서버가 정한다.
-  async exportPng({ documentId }) {
+  // hideLayerIds: 저장하는 동안만 숨길 레이어 (예: 누끼 결과에서 피사체만 저장하려고 배경을 숨김). 끝나면 원래대로.
+  async exportPng({ documentId, hideLayerIds }) {
     const doc = requireDocument(documentId);
     const tmp = await storage.localFileSystem.getTemporaryFolder(); // 권한 없이 쓸 수 있는 플러그인 임시 폴더
     const file = await tmp.createFile("ps-agent-export.png", { overwrite: true });
+    const toHide = (hideLayerIds || []).length ? doc.layers.filter((l) => hideLayerIds.includes(l.id) && l.visible) : [];
     await core.executeAsModal(
-      async () => {
-        await doc.saveAs.png(file, undefined, true); // true = 사본으로 저장 (작업 문서는 그대로)
+      async (ctx) => {
+        // 숨겼다 켜는 것도 히스토리에 남으므로 1칸으로 묶는다
+        const historyId = toHide.length ? await ctx.hostControl.suspendHistory({ documentID: doc.id, name: "PS Agent: PNG 내보내기" }) : null;
+        try {
+          for (const l of toHide) l.visible = false;
+          await doc.saveAs.png(file, undefined, true); // true = 사본으로 저장 (작업 문서는 그대로)
+        } finally {
+          for (const l of toHide) l.visible = true; // 실패해도 다시 보이게
+        }
+        if (historyId !== null) await ctx.hostControl.resumeHistory(historyId);
       },
       { commandName: "PS Agent: PNG 내보내기" },
     );

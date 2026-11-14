@@ -4,6 +4,7 @@
 //  ⑥ logs 기록   ⑦ 생성 횟수 상한   ⑧ 잘못된 영역 거절   ⑨ 브라우저 Origin 접속 거절
 //  ⑩ 서버 2개 동시 실행(relay)   ⑪ 중계소가 꺼지면 relay 가 넘겨받기
 //  ⑫ 프롬프트 가이드(RAG)   ⑬ 생성 실패 시 실패 분석   ⑭ 구도 RAG   ⑮ 점검 안 받은 프롬프트 거절   ⑯ 정보 수집관 패턴
+//  ⑰ 누끼: input 폴더 안의 사진만 열기 · 배경 제거 결과 저장
 // 실행: npm run build 후  node scripts/selftest.mjs
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -27,13 +28,17 @@ writeFileSync(
     .map((o) => JSON.stringify(o))
     .join("\n") + "\n",
 );
+// ⑰ 누끼 테스트용 input 폴더 (실제 input/ 과 섞이지 않게 임시 폴더)
+const INPUT = mkdtempSync(join(tmpdir(), "ps-agent-input-"));
+writeFileSync(join(INPUT, "고양이.png"), await sharp({ create: { width: 8, height: 8, channels: 3, background: "#00ff00" } }).png().toBuffer());
+writeFileSync(join(INPUT, "메모.txt"), "사진 아님");
 const client = new Client({ name: "selftest", version: "0.0.1" });
 await client.connect(
   new StdioClientTransport({
     command: "node",
     args: ["dist/index.js"],
     // 생성 상한을 2로 낮춰서 3번째가 막히는지 본다
-    env: { ...process.env, PS_AGENT_PORT: String(PORT), PS_AGENT_LOGS_DIR: LOGS, PS_AGENT_MAX_GENERATIONS: "2" },
+    env: { ...process.env, PS_AGENT_PORT: String(PORT), PS_AGENT_LOGS_DIR: LOGS, PS_AGENT_MAX_GENERATIONS: "2", PS_AGENT_INPUT_DIR: INPUT },
     stderr: "inherit",
   }),
 );
@@ -46,7 +51,7 @@ const check = (label, ok, detail = "") => {
 };
 
 const tools = (await client.listTools()).tools.map((t) => t.name);
-check("① 도구 목록", tools.length === 7, tools.join(", "));
+check("① 도구 목록", tools.length === 9, tools.join(", "));
 
 const notConnected = await call("ps_status");
 check("② 미연결 안내", notConnected.content[0].text.includes("연결"), "ps_status");
@@ -58,9 +63,22 @@ const redPng = (await sharp({ create: { width: 64, height: 64, channels: 3, back
 const fake = new WebSocket(`ws://127.0.0.1:${PORT}`);
 await new Promise((r) => fake.on("open", r));
 const received = []; // 가짜 플러그인이 받은 명령 (포토샵까지 전달됐는지 확인용)
+let openedParams = null; // ⑰ openImage 로 받은 내용
+let cutParams = null; // ⑰ removeBackground 로 받은 내용
+const exportHides = []; // ⑰ exportPng 때 숨기라고 받은 레이어
 fake.on("message", (raw) => {
-  const { id, command } = JSON.parse(raw.toString());
+  const { id, command, params } = JSON.parse(raw.toString());
   received.push(command);
+  if (command === "openImage") {
+    openedParams = params;
+    return fake.send(JSON.stringify({ id, ok: true, result: { id: 7, name: params.fileName, width: 8, height: 8, layers: [] } }));
+  }
+  if (command === "removeBackground") {
+    cutParams = params;
+    const result = { documentId: 7, documentName: "고양이.png", seconds: 1, subjectCoveragePercent: 40, subjectLayer: { id: 3 }, backgroundLayer: { id: 2 }, extraBackgroundLayerIds: [] };
+    return fake.send(JSON.stringify({ id, ok: true, result }));
+  }
+  if (command === "exportPng") exportHides.push(params?.hideLayerIds ?? []);
   // 프롬프트에 REJECT 가 있으면 Firefly 거절을 흉내 낸다 (⑬ 실패 분석 테스트용)
   if (command === "generateImage" && String(JSON.parse(raw.toString()).params?.prompt).includes("REJECT")) {
     return fake.send(JSON.stringify({ id, ok: false, error: "생성이 실패했습니다: 포토샵이 0.9초 만에 끝냈지만 새 레이어가 생기지 않았습니다." }));
@@ -125,6 +143,38 @@ check("⑦ ps_status 에 남은 횟수 표시", st.generations?.remaining === 0,
 await call("ps_prompt_guide", { request: "테스트", draft: "x" });
 const bad = await call("ps_generative_fill", { prompt: "x", left: 100, top: 0, right: 50, bottom: 10, documentId: 1 });
 check("⑧ 잘못된 영역은 거절", bad.isError === true && bad.content[0].text.includes("영역이 잘못"));
+
+// ⑰ 누끼: input 폴더 안의 사진만 열고, 경로·형식이 이상하면 포토샵에 보내기 전에 거절
+const listed = JSON.parse((await call("ps_open_image", {})).content[0].text);
+check("⑰ 파일 이름 없이 호출 → 사진 목록만", JSON.stringify(listed.images) === JSON.stringify(["고양이.png"]), JSON.stringify(listed.images));
+const opened = await call("ps_open_image", { filename: "고양이.png" });
+const origBytes = readFileSync(join(INPUT, "고양이.png"));
+check("⑰ 사진 열기 → 파일 내용이 그대로 플러그인에 전달", !opened.isError && openedParams?.dataBase64 === origBytes.toString("base64"));
+const sentBefore = received.length;
+for (const name of ["../secret.png", "..\\secret.png", "C:\\Windows\\win.ini", "메모.txt", "없는파일.jpg"]) {
+  const r = await call("ps_open_image", { filename: name });
+  check(`⑰ "${name}" 거절`, r.isError === true, r.content[0].text.split("\n")[0].slice(0, 60));
+}
+check("⑰ 거절된 요청은 포토샵에 전달 안 됨", received.length === sentBefore);
+const missing = await call("ps_open_image", { filename: "없는파일.jpg" });
+check("⑰ 없는 파일 → 있는 사진 목록 안내", missing.content[0].text.includes("고양이.png"));
+// 이 시점에 생성 상한(2회)을 다 썼다 → 기본값(AI 채우기)은 포토샵에 보내지 않고 거절돼야 한다
+const cutGen = await call("ps_remove_background", { documentId: 7 });
+check("⑰ AI 채우기 누끼도 생성 상한 적용", cutGen.isError === true && cutGen.content[0].text.includes("상한") && cutParams === null);
+check("⑰ 다듬기까지 하면 2회 필요하다고 안내", cutGen.content[0].text.includes("2회 필요"));
+// 내용 인식 채우기(크레딧 없음)는 상한과 무관
+const cut = await call("ps_remove_background", { documentId: 7, backgroundFill: "contentAware" });
+const cutPaths = [...cut.content.map((c) => c.text ?? "").join("\n").matchAll(/저장: (.+?\.png)/g)].map((m) => m[1]);
+savedPaths.push(...cutPaths);
+check("⑰ 채우기 방식·넓힘 기본값(2%) 전달, 내용 인식엔 다듬기 없음", cutParams?.backgroundFill === "contentAware" && cutParams?.expandPercent === 2 && cutParams?.refine === false);
+const cutUnchecked = await call("ps_remove_background", { documentId: 7, backgroundFill: "generative", backgroundPrompt: "plain white wall" });
+check("⑰ 점검 안 받은 배경 프롬프트는 거절", cutUnchecked.isError === true && cutUnchecked.content[0].text.includes("사전 점검"));
+check(
+  "⑰ 누끼 → 피사체 · 배경 PNG 2장 + 미리보기 2장",
+  !cut.isError && cutPaths.length === 2 && cutPaths.every((p) => existsSync(p)) && cut.content.filter((c) => c.type === "image").length === 2,
+  cutPaths.join(" , "),
+);
+check("⑰ 피사체 저장 땐 배경을, 배경 저장 땐 피사체를 숨김", JSON.stringify(exportHides.slice(-2)) === "[[2],[3]]", JSON.stringify(exportHides.slice(-2)));
 
 // ⑨ Origin 허용 목록: 웹페이지(https://), 로컬 HTML 파일(null) 은 거절
 const tryConnect = (origin) =>
@@ -196,6 +246,7 @@ await client2.close();
 // 테스트로 만든 파일 정리
 for (const p of savedPaths) if (p && existsSync(p)) rmSync(p);
 rmSync(LOGS, { recursive: true, force: true });
+rmSync(INPUT, { recursive: true, force: true });
 
 fake.close();
 console.log(failed ? `\n${failed}개 실패` : "\n모두 통과");

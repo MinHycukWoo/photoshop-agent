@@ -31,7 +31,8 @@ export interface SavedImage {
   previewSize: { width: number; height: number };
 }
 
-export async function savePng(pngBase64: string, name: string): Promise<SavedImage> {
+// previewBackground: 미리보기에서 투명한 부분을 채울 색. 누끼 결과는 흰 배경과 구분되게 회색을 쓴다
+export async function savePng(pngBase64: string, name: string, previewBackground = "#ffffff"): Promise<SavedImage> {
   await mkdir(OUTPUT_DIR, { recursive: true });
   const path = resolve(join(OUTPUT_DIR, `${timestamp()}_${safeBaseName(name)}.png`));
   // 이중 안전장치: 최종 경로가 정말 output/ 안인지 한 번 더 확인
@@ -43,7 +44,7 @@ export async function savePng(pngBase64: string, name: string): Promise<SavedIma
   // 원본은 그대로 두고, 미리보기만 줄여서 JPEG 로 (대화에 넣기 가벼움)
   const { data, info } = await sharp(png)
     .resize(PREVIEW_MAX_SIDE, PREVIEW_MAX_SIDE, { fit: "inside", withoutEnlargement: true })
-    .flatten({ background: "#ffffff" }) // 투명 부분은 흰색으로
+    .flatten({ background: previewBackground }) // 투명 부분은 이 색으로 (PNG 원본은 투명 그대로)
     .jpeg({ quality: 82 })
     .toBuffer({ resolveWithObject: true });
 
